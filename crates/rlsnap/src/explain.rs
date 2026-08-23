@@ -92,7 +92,9 @@ pub async fn run_explain(
         .apply(&tx)
         .await
         .with_context(|| format!("apply persona {persona_name:?}"))?;
-    let outcome = probe::has_table_priv(&tx, table, privilege).await;
+    let outcome = probe::has_table_priv(&tx, table, privilege)
+        .await
+        .context("probe table privilege")?;
     out.push_str(&format!("outcome: {outcome:?}\n\n"));
 
     out.push_str("table-level grants:\n");

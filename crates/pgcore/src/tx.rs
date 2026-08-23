@@ -177,6 +177,26 @@ impl<'a> Savepoint<'a> {
             .batch_execute(&format!("ROLLBACK TO SAVEPOINT {ident}"))
             .await
     }
+
+    /// Roll back to this savepoint, discarding any effects since it was
+    /// established, then release it. Used by probes that must never leave a
+    /// side effect (e.g. an `INSERT`) visible to the rest of a persona's
+    /// transaction, whether the probe succeeded or failed: `release()` alone
+    /// would keep a successful probe's effects live in the surrounding,
+    /// still-open transaction; `rollback_to()` alone would keep the
+    /// (now-empty) savepoint on the stack for the lifetime of that
+    /// transaction, which probes in a tight loop would otherwise accumulate
+    /// by the thousand.
+    pub async fn discard(mut self) -> std::result::Result<(), tokio_postgres::Error> {
+        let ident = quote_ident(&self.name);
+        self.resolved = true;
+        self.tx
+            .client()
+            .batch_execute(&format!(
+                "ROLLBACK TO SAVEPOINT {ident}; RELEASE SAVEPOINT {ident}"
+            ))
+            .await
+    }
 }
 
 impl<'a> Drop for Savepoint<'a> {

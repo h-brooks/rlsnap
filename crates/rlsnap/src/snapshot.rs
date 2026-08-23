@@ -136,7 +136,8 @@ async fn run_persona(
             columns,
             want_rows,
         )
-        .await;
+        .await
+        .with_context(|| format!("probe table {qualified:?} for persona {:?}", persona.name))?;
         if let Some(c) = count {
             row_counts.insert(qualified.clone(), c);
         }
@@ -145,7 +146,9 @@ async fn run_persona(
 
     let mut function_results = BTreeMap::new();
     for sig in functions.iter() {
-        let outcome = probe::probe_function(&tx, sig).await;
+        let outcome = probe::probe_function(&tx, sig)
+            .await
+            .with_context(|| format!("probe function {sig:?} for persona {:?}", persona.name))?;
         function_results.insert(sig.clone(), outcome);
     }
 
@@ -153,7 +156,10 @@ async fn run_persona(
     if want_rows {
         for a in per_persona_asserts.iter() {
             let finding_name = format!("assert:{}:{}", a.name, persona.name);
-            match probe::run_assert(&tx, &a.sql).await {
+            let result = probe::run_assert(&tx, &a.sql).await.with_context(|| {
+                format!("run assert {:?} for persona {:?}", a.name, persona.name)
+            })?;
+            match result {
                 Ok(0) => {}
                 Ok(n) => assert_findings.push(Finding {
                     name: finding_name,
@@ -228,7 +234,10 @@ pub async fn build_snapshot(
     if want_rows {
         for a in &global_asserts {
             let finding_name = format!("assert:{}", a.name);
-            match probe::run_assert(&discovery_tx, &a.sql).await {
+            let result = probe::run_assert(&discovery_tx, &a.sql)
+                .await
+                .with_context(|| format!("run global assert {:?}", a.name))?;
+            match result {
                 Ok(0) => {}
                 Ok(n) => global_findings.push(Finding {
                     name: finding_name,
