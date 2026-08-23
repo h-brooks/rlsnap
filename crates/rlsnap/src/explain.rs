@@ -7,6 +7,7 @@ use pgcore::catalog;
 use pgcore::RollbackTx;
 
 use crate::config::RlsnapConfig;
+use crate::probe;
 
 /// Map an op name (as used in the privileges section) to the Postgres
 /// privilege/command it corresponds to.
@@ -20,6 +21,29 @@ fn op_to_privilege(op: &str) -> Result<&'static str> {
             "unknown op {other:?} (expected one of: select_count, select, insert, insert_returning, update, delete)"
         )),
     }
+}
+
+/// Whether `persona_role` would exercise a grant made to `grantee` -- either
+/// because it's a literal match, `grantee` is the `public` pseudo-role (any
+/// casing, matching how `information_schema` reports it), or `persona_role`
+/// is a (possibly indirect) member of `grantee` and so inherits its
+/// privileges the same way `has_table_privilege`/`has_column_privilege`
+/// already account for internally. Without this, explain's grant listing
+/// only found grants made to the persona's literal role name and silently
+/// missed anything inherited via role membership -- the normal shape for a
+/// custom application role in Supabase.
+async fn persona_holds_role(tx: &RollbackTx, persona_role: &str, grantee: &str) -> bool {
+    if grantee.eq_ignore_ascii_case("public") || grantee == persona_role {
+        return true;
+    }
+    tx.query(
+        "SELECT pg_has_role($1, $2, 'MEMBER')",
+        &[&persona_role, &grantee],
+    )
+    .await
+    .ok()
+    .and_then(|rows| rows.first().map(|row| row.get(0)))
+    .unwrap_or(false)
 }
 
 pub async fn run_explain(
@@ -47,7 +71,6 @@ pub async fn run_explain(
     let catalog = catalog::snapshot(&tx, &config.schemas)
         .await
         .context("snapshot catalog")?;
-    tx.finish().await.context("finish transaction")?;
 
     let info = catalog.tables.get(table).ok_or_else(|| {
         anyhow!(
@@ -58,21 +81,25 @@ pub async fn run_explain(
 
     let mut out = String::new();
     out.push_str(&format!(
-        "persona {persona_name:?} (role {:?}), table {table:?}, op {op:?} ({privilege})\n\n",
+        "persona {persona_name:?} (role {:?}), table {table:?}, op {op:?} ({privilege})\n",
         persona.role
     ));
 
+    // The same table-level check the snapshot itself would record for this
+    // cell, so the grant/policy listing below can be cross-checked against
+    // the actual outcome instead of trusted on faith.
+    persona
+        .apply(&tx)
+        .await
+        .with_context(|| format!("apply persona {persona_name:?}"))?;
+    let outcome = probe::has_table_priv(&tx, table, privilege).await;
+    out.push_str(&format!("outcome: {outcome:?}\n\n"));
+
     out.push_str("table-level grants:\n");
     let mut any_table_grant = false;
-    if let Some(privs) = info.table_grants.grants.get(&persona.role) {
-        if privs.contains(privilege) {
-            out.push_str(&format!("  GRANT {privilege} ... TO {}\n", persona.role));
-            any_table_grant = true;
-        }
-    }
-    if let Some(privs) = info.table_grants.grants.get("public") {
-        if privs.contains(privilege) {
-            out.push_str(&format!("  GRANT {privilege} ... TO public\n"));
+    for (grantee, privs) in &info.table_grants.grants {
+        if privs.contains(privilege) && persona_holds_role(&tx, &persona.role, grantee).await {
+            out.push_str(&format!("  GRANT {privilege} ... TO {grantee}\n"));
             any_table_grant = true;
         }
     }
@@ -83,12 +110,8 @@ pub async fn run_explain(
     out.push_str("\ncolumn-level grants:\n");
     let mut any_col_grant = false;
     for (column, grants) in &info.column_grants {
-        for grantee in [persona.role.as_str(), "public"] {
-            if grants
-                .grants
-                .get(grantee)
-                .is_some_and(|p| p.contains(privilege))
-            {
+        for (grantee, privs) in &grants.grants {
+            if privs.contains(privilege) && persona_holds_role(&tx, &persona.role, grantee).await {
                 out.push_str(&format!(
                     "  GRANT {privilege} ({column}) ... TO {grantee}\n"
                 ));
@@ -108,10 +131,13 @@ pub async fn run_explain(
     let mut any_policy = false;
     for (name, policy) in &info.policies {
         let cmd_matches = policy.cmd == "ALL" || policy.cmd == privilege;
-        let role_matches = policy
-            .roles
-            .iter()
-            .any(|r| r == &persona.role || r == "public");
+        let mut role_matches = false;
+        for r in &policy.roles {
+            if persona_holds_role(&tx, &persona.role, r).await {
+                role_matches = true;
+                break;
+            }
+        }
         if cmd_matches && role_matches {
             out.push_str(&format!(
                 "  {name}: cmd={} permissive={} roles={:?}\n    USING: {}\n    WITH CHECK: {}\n",
@@ -127,6 +153,8 @@ pub async fn run_explain(
     if !any_policy {
         out.push_str("  (none)\n");
     }
+
+    tx.finish().await.context("finish transaction")?;
 
     Ok(out)
 }
