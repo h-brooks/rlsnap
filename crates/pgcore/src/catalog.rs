@@ -50,6 +50,13 @@ pub struct TableInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FunctionInfo {
+    /// Probe-safe signature: schema-qualified name with INPUT argument
+    /// types only (`oidvectortypes(proargtypes)`), which is the only form
+    /// `has_function_privilege` reliably parses. Derived, deterministic,
+    /// and excluded from serialized snapshots so it never appears in a
+    /// baseline or diff.
+    #[serde(skip)]
+    pub probe_signature: String,
     pub arguments: String,
     pub returns: String,
     pub security_definer: bool,
@@ -331,7 +338,8 @@ pub async fn snapshot(
             "SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid), \
                     pg_get_function_result(p.oid), p.prosecdef, \
                     CASE WHEN p.prokind IN ('f', 'p') THEN pg_get_functiondef(p.oid) END, \
-                    pg_get_userbyid(p.proowner), p.provolatile::text, p.proconfig \
+                    pg_get_userbyid(p.proowner), p.provolatile::text, p.proconfig, \
+                    oidvectortypes(p.proargtypes) \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              WHERE n.nspname = ANY($1)",
@@ -348,10 +356,16 @@ pub async fn snapshot(
         let owner: String = row.get(6);
         let volatility: String = row.get(7);
         let config: Option<Vec<String>> = row.get(8);
+        let input_types: String = row.get(9);
         let key = format!("{schema}.{name}({arguments})");
+        // has_function_privilege cannot parse OUT parameters (which
+        // pg_get_function_identity_arguments includes for functions), so
+        // probes get a signature built from input types only.
+        let probe_signature = format!("{schema}.{name}({input_types})");
         catalog.functions.insert(
             key,
             FunctionInfo {
+                probe_signature,
                 arguments: normalize_ws(&arguments),
                 returns,
                 security_definer,

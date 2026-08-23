@@ -646,3 +646,39 @@ async fn diff_rejects_a_catalog_snapshot_against_a_behavioural_snapshot_of_the_s
 
     h.close().await;
 }
+
+#[tokio::test]
+async fn function_with_out_parameters_is_probed_not_fatal() {
+    // Regression: pg_get_function_identity_arguments includes OUT params
+    // for functions, and has_function_privilege cannot parse the OUT
+    // keyword (42601 on real schemas). Probing must use input types only;
+    // the OUT-bearing signature stays as the display key.
+    let h = TestHarness::new(
+        "CREATE FUNCTION public.actual_for(p_section text, OUT o_table text, OUT o_flag boolean) \
+             LANGUAGE sql AS $$ SELECT 'x', true $$;",
+        "schemas = [\"public\"]\n",
+        "catalog",
+        1000,
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "snap.json"])
+        .await
+        .unwrap();
+
+    let snap: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("snap.json")).unwrap()).unwrap();
+    let keys: Vec<&String> = snap
+        .functions
+        .get("anon")
+        .expect("anon persona present")
+        .keys()
+        .filter(|k| k.contains("actual_for"))
+        .collect();
+    assert_eq!(keys.len(), 1, "function present under its display key");
+    assert!(
+        keys[0].contains("OUT o_table"),
+        "display key keeps OUT params: {}",
+        keys[0]
+    );
+}

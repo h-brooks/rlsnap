@@ -108,7 +108,7 @@ async fn run_persona(
     target: pgcore::config::Target,
     persona: Persona,
     tables: Arc<Vec<(String, BTreeMap<String, ColumnInfo>)>>,
-    functions: Arc<Vec<String>>,
+    functions: Arc<Vec<(String, String)>>,
     per_persona_asserts: Arc<Vec<AssertCfg>>,
     mode: Mode,
     want_rows: bool,
@@ -155,11 +155,16 @@ async fn run_persona(
     }
 
     let mut function_results = BTreeMap::new();
-    for sig in functions.iter() {
-        let outcome = probe::probe_function(&tx, sig)
+    for (display_sig, probe_sig) in functions.iter() {
+        let outcome = probe::probe_function(&tx, probe_sig)
             .await
-            .with_context(|| format!("probe function {sig:?} for persona {:?}", persona.name))?;
-        function_results.insert(sig.clone(), outcome);
+            .with_context(|| {
+                format!(
+                    "probe function {display_sig:?} for persona {:?}",
+                    persona.name
+                )
+            })?;
+        function_results.insert(display_sig.clone(), outcome);
     }
 
     let mut assert_findings = Vec::new();
@@ -315,11 +320,11 @@ pub async fn build_snapshot(
         .filter(|(name, _)| !any_match(&config.excludes, name))
         .map(|(name, info)| (name.clone(), info.columns.clone()))
         .collect();
-    let filtered_functions: Vec<String> = catalog
+    let filtered_functions: Vec<(String, String)> = catalog
         .functions
-        .keys()
-        .filter(|sig| !any_match(&config.excludes, function_bare_name(sig)))
-        .cloned()
+        .iter()
+        .filter(|(sig, _)| !any_match(&config.excludes, function_bare_name(sig)))
+        .map(|(sig, info)| (sig.clone(), info.probe_signature.clone()))
         .collect();
 
     let tables = Arc::new(filtered_tables);
