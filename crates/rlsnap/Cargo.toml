@@ -12,4 +12,13 @@ path = "src/main.rs"
 pgcore = { path = "../pgcore" }
 clap = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
