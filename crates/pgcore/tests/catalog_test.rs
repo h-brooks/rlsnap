@@ -140,6 +140,77 @@ async fn diff_names_a_changed_function_body() {
 }
 
 #[tokio::test]
+async fn policy_qual_whitespace_inside_a_string_literal_is_significant() {
+    // Item F: whitespace-normalising pg_get_expr output collapses `'A  B'`
+    // (two spaces) and `'A B'` (one space) to the same text, hiding a real
+    // change in what the policy actually matches.
+    let db = TestDb::create().await;
+    db.load_fixture(
+        "CREATE TABLE widgets (id int primary key, label text); \
+         ALTER TABLE widgets ENABLE ROW LEVEL SECURITY; \
+         GRANT SELECT ON widgets TO authenticated; \
+         CREATE POLICY widgets_select ON widgets FOR SELECT TO authenticated \
+            USING (label = 'A  B');",
+    )
+    .await;
+    let before = snapshot_public(&db).await;
+
+    db.load_fixture(
+        "DROP POLICY widgets_select ON widgets; \
+         CREATE POLICY widgets_select ON widgets FOR SELECT TO authenticated \
+            USING (label = 'A B');",
+    )
+    .await;
+    let after = snapshot_public(&db).await;
+
+    let diff = Catalog::diff(&before, &after);
+    assert!(
+        !diff.is_empty(),
+        "a policy qual differing only in string-literal whitespace must still be a detected \
+         change, not silently normalised away"
+    );
+    let changed_paths: Vec<&String> = diff.changed.keys().collect();
+    assert!(
+        changed_paths
+            .iter()
+            .any(|p| p.contains("widgets.policies.widgets_select") && p.ends_with(".qual")),
+        "diff should name the changed qual: {changed_paths:?}"
+    );
+
+    db.close().await;
+}
+
+#[tokio::test]
+async fn function_definition_whitespace_inside_a_string_literal_is_significant() {
+    let db = TestDb::create().await;
+    db.load_fixture("CREATE FUNCTION greeting() RETURNS text AS $$ SELECT 'A  B' $$ LANGUAGE sql;")
+        .await;
+    let before = snapshot_public(&db).await;
+
+    db.load_fixture(
+        "CREATE OR REPLACE FUNCTION greeting() RETURNS text AS $$ SELECT 'A B' $$ LANGUAGE sql;",
+    )
+    .await;
+    let after = snapshot_public(&db).await;
+
+    let diff = Catalog::diff(&before, &after);
+    assert!(
+        !diff.is_empty(),
+        "a function body differing only in string-literal whitespace must still be a detected \
+         change, not silently normalised away"
+    );
+    let changed_paths: Vec<&String> = diff.changed.keys().collect();
+    assert!(
+        changed_paths
+            .iter()
+            .any(|p| p.contains("functions.public.greeting") && p.ends_with(".definition")),
+        "diff should name the changed function definition: {changed_paths:?}"
+    );
+
+    db.close().await;
+}
+
+#[tokio::test]
 async fn diff_of_identical_snapshots_is_empty() {
     let db = TestDb::create().await;
     db.load_fixture("CREATE TABLE widgets (id int primary key, name text);")

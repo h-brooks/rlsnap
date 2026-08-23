@@ -20,7 +20,12 @@ pub struct PolicyInfo {
     pub cmd: String,
     pub permissive: bool,
     pub roles: Vec<String>,
+    /// `pg_policies.qual` (`pg_get_expr` output), verbatim: it is already
+    /// canonical and deterministic for a given expression, and
+    /// whitespace-normalising it would collapse meaningful whitespace
+    /// inside a string literal.
     pub qual: Option<String>,
+    /// `pg_policies.with_check`, verbatim (see `qual`).
     pub with_check: Option<String>,
 }
 
@@ -48,11 +53,13 @@ pub struct FunctionInfo {
     pub arguments: String,
     pub returns: String,
     pub security_definer: bool,
-    /// `pg_get_functiondef(oid)`, whitespace-normalised. `None` for an
-    /// aggregate or window function: `pg_get_functiondef` raises an error
-    /// for those (it only knows how to reconstruct plain functions and
-    /// procedures), so it is never called for them rather than caught after
-    /// the fact.
+    /// `pg_get_functiondef(oid)`, verbatim: it is already canonical and
+    /// deterministic for a given definition, and whitespace-normalising it
+    /// would collapse meaningful whitespace inside a string literal in the
+    /// function body. `None` for an aggregate or window function:
+    /// `pg_get_functiondef` raises an error for those (it only knows how to
+    /// reconstruct plain functions and procedures), so it is never called
+    /// for them rather than caught after the fact.
     pub definition: Option<String>,
     pub owner: String,
     /// Raw `pg_proc.provolatile` code: `i` (immutable), `s` (stable), or `v`
@@ -215,8 +222,13 @@ pub async fn snapshot(
                 cmd,
                 permissive: permissive == "PERMISSIVE",
                 roles,
-                qual: qual.map(|q| normalize_ws(&q)),
-                with_check: with_check.map(|w| normalize_ws(&w)),
+                // Stored verbatim (pg_get_expr output, via pg_policies): it
+                // is already canonical and deterministic for a given
+                // expression, and whitespace-normalising it would collapse
+                // meaningful whitespace inside a string literal (`'A  B'`
+                // and `'A B'` are different values, not the same policy).
+                qual,
+                with_check,
             },
         );
     }
@@ -343,7 +355,11 @@ pub async fn snapshot(
                 arguments: normalize_ws(&arguments),
                 returns,
                 security_definer,
-                definition: definition.map(|d| normalize_ws(&d)),
+                // Stored verbatim (pg_get_functiondef output): see the
+                // comment on PolicyInfo's qual/with_check above for why --
+                // the same risk applies to a function body's string
+                // literals.
+                definition,
                 owner,
                 volatility,
                 config: config.unwrap_or_default(),
