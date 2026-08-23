@@ -2,7 +2,7 @@
 //! friends) and behavioural-mode actual DML, each wrapped in its own
 //! savepoint so an error (denial, timeout, or otherwise) never poisons the
 //! rest of the persona's transaction, and retried on a statement timeout so
-//! output stays deterministic across runs (see [`is_statement_timeout`]).
+//! output stays deterministic across runs (see [`is_retryable_timeout`]).
 //!
 //! Every savepoint is always discarded (`ROLLBACK TO SAVEPOINT`, then
 //! `RELEASE SAVEPOINT`) whether the probe succeeded or failed, so a
@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use pgcore::catalog::ColumnInfo;
 use pgcore::config::Mode;
 use pgcore::tx::quote_ident;
-use pgcore::{classify, Outcome, RollbackTx};
+use pgcore::{classify, InfrastructureError, Outcome, RollbackTx};
 
 use crate::snapshot::{ColumnPriv, TablePriv};
 
@@ -47,14 +47,16 @@ fn quoted_table_ref(qualified: &str) -> String {
 /// perform the operation, only that this attempt didn't finish in time. Left
 /// unretried, a probe that occasionally lands on either side of the timeout
 /// boundary makes the whole snapshot non-deterministic across otherwise
-/// identical runs. Retry a bounded number of times before accepting one as
-/// final, so a run against an unchanged database converges to the same
-/// answer: allowed/denied if the probe can complete within budget on any
-/// attempt, or a consistent timeout error if it never can.
+/// identical runs. Retry a bounded number of times before giving up, so a
+/// run against an unchanged database converges to the same answer:
+/// allowed/denied if the probe can complete within budget on any attempt.
+/// If it never can, that is an infrastructure failure (see
+/// [`pgcore::classify`]), not a probe outcome: it aborts the whole run
+/// rather than becoming baseline content.
 const MAX_TIMEOUT_ATTEMPTS: u32 = 3;
 
-fn is_statement_timeout(outcome: &Outcome) -> bool {
-    matches!(outcome, Outcome::Error { sqlstate, .. } if sqlstate == "57014")
+fn is_retryable_timeout(infra: &InfrastructureError) -> bool {
+    infra.sqlstate == "57014"
 }
 
 /// Run a boolean ACL-check function (`has_table_privilege`,
@@ -62,7 +64,7 @@ fn is_statement_timeout(outcome: &Outcome) -> bool {
 /// result into an [`Outcome`]. These never touch table data. Wrapped in its
 /// own savepoint so a lookup error (e.g. a relation that doesn't resolve)
 /// cannot poison the rest of the persona's transaction, and retried on a
-/// statement timeout for determinism (see [`is_statement_timeout`]).
+/// statement timeout for determinism (see [`is_retryable_timeout`]).
 pub(crate) async fn bool_check(
     tx: &RollbackTx,
     sql: &str,
@@ -70,29 +72,34 @@ pub(crate) async fn bool_check(
 ) -> Result<Outcome> {
     for attempt in 0..MAX_TIMEOUT_ATTEMPTS {
         let name = next_savepoint_name();
-        let outcome = match tx.savepoint(&name).await {
-            Ok(sp) => match tx.query(sql, params).await {
-                Ok(rows) => {
-                    let ok: bool = rows[0].get(0);
-                    sp.discard().await.context("discard probe savepoint")?;
-                    if ok {
-                        Outcome::Allowed
-                    } else {
-                        Outcome::DeniedPrivilege
+        let classified: std::result::Result<Outcome, InfrastructureError> =
+            match tx.savepoint(&name).await {
+                Ok(sp) => match tx.query(sql, params).await {
+                    Ok(rows) => {
+                        let ok: bool = rows[0].get(0);
+                        sp.discard().await.context("discard probe savepoint")?;
+                        Ok(if ok {
+                            Outcome::Allowed
+                        } else {
+                            Outcome::DeniedPrivilege
+                        })
                     }
-                }
-                Err(e) => {
-                    let outcome = classify(&e);
-                    sp.discard()
-                        .await
-                        .context("discard probe savepoint after error")?;
-                    outcome
-                }
-            },
-            Err(e) => classify(&e),
-        };
-        if !is_statement_timeout(&outcome) || attempt + 1 == MAX_TIMEOUT_ATTEMPTS {
-            return Ok(outcome);
+                    Err(e) => {
+                        let classified = classify(&e);
+                        sp.discard()
+                            .await
+                            .context("discard probe savepoint after error")?;
+                        classified
+                    }
+                },
+                Err(e) => classify(&e),
+            };
+        match classified {
+            Ok(outcome) => return Ok(outcome),
+            Err(infra) if is_retryable_timeout(&infra) && attempt + 1 < MAX_TIMEOUT_ATTEMPTS => {
+                continue;
+            }
+            Err(infra) => return Err(infra.into()),
         }
     }
     unreachable!("loop always returns on its last iteration")
@@ -130,28 +137,34 @@ async fn has_column_priv(
 /// Run `sql` as a one-off DML probe inside its own savepoint, always
 /// discarded afterwards (see the module doc) so neither a successful nor a
 /// failed probe leaves the transaction changed. Retried on a statement
-/// timeout (see [`is_statement_timeout`]).
+/// timeout (see [`is_retryable_timeout`]); any other infrastructure failure
+/// aborts immediately.
 async fn probe_dml(tx: &RollbackTx, sql: &str) -> Result<Outcome> {
     for attempt in 0..MAX_TIMEOUT_ATTEMPTS {
         let name = next_savepoint_name();
-        let outcome = match tx.savepoint(&name).await {
-            Ok(sp) => match tx.execute(sql, &[]).await {
-                Ok(_) => {
-                    sp.discard().await.context("discard probe savepoint")?;
-                    Outcome::Allowed
-                }
-                Err(e) => {
-                    let outcome = classify(&e);
-                    sp.discard()
-                        .await
-                        .context("discard probe savepoint after error")?;
-                    outcome
-                }
-            },
-            Err(e) => classify(&e),
-        };
-        if !is_statement_timeout(&outcome) || attempt + 1 == MAX_TIMEOUT_ATTEMPTS {
-            return Ok(outcome);
+        let classified: std::result::Result<Outcome, InfrastructureError> =
+            match tx.savepoint(&name).await {
+                Ok(sp) => match tx.execute(sql, &[]).await {
+                    Ok(_) => {
+                        sp.discard().await.context("discard probe savepoint")?;
+                        Ok(Outcome::Allowed)
+                    }
+                    Err(e) => {
+                        let classified = classify(&e);
+                        sp.discard()
+                            .await
+                            .context("discard probe savepoint after error")?;
+                        classified
+                    }
+                },
+                Err(e) => classify(&e),
+            };
+        match classified {
+            Ok(outcome) => return Ok(outcome),
+            Err(infra) if is_retryable_timeout(&infra) && attempt + 1 < MAX_TIMEOUT_ATTEMPTS => {
+                continue;
+            }
+            Err(infra) => return Err(infra.into()),
         }
     }
     unreachable!("loop always returns on its last iteration")
@@ -166,25 +179,30 @@ async fn probe_select_count(tx: &RollbackTx, qualified: &str) -> Result<(Outcome
     let sql = format!("SELECT count(*) FROM {}", quoted_table_ref(qualified));
     for attempt in 0..MAX_TIMEOUT_ATTEMPTS {
         let name = next_savepoint_name();
-        let (outcome, count) = match tx.savepoint(&name).await {
-            Ok(sp) => match tx.query(&sql, &[]).await {
-                Ok(rows) => {
-                    let count: i64 = rows[0].get(0);
-                    sp.discard().await.context("discard probe savepoint")?;
-                    (Outcome::Allowed, Some(count))
-                }
-                Err(e) => {
-                    let outcome = classify(&e);
-                    sp.discard()
-                        .await
-                        .context("discard probe savepoint after error")?;
-                    (outcome, None)
-                }
-            },
-            Err(e) => (classify(&e), None),
-        };
-        if !is_statement_timeout(&outcome) || attempt + 1 == MAX_TIMEOUT_ATTEMPTS {
-            return Ok((outcome, count));
+        let classified: std::result::Result<(Outcome, Option<i64>), InfrastructureError> =
+            match tx.savepoint(&name).await {
+                Ok(sp) => match tx.query(&sql, &[]).await {
+                    Ok(rows) => {
+                        let count: i64 = rows[0].get(0);
+                        sp.discard().await.context("discard probe savepoint")?;
+                        Ok((Outcome::Allowed, Some(count)))
+                    }
+                    Err(e) => {
+                        let classified = classify(&e).map(|o| (o, None));
+                        sp.discard()
+                            .await
+                            .context("discard probe savepoint after error")?;
+                        classified
+                    }
+                },
+                Err(e) => classify(&e).map(|o| (o, None)),
+            };
+        match classified {
+            Ok(result) => return Ok(result),
+            Err(infra) if is_retryable_timeout(&infra) && attempt + 1 < MAX_TIMEOUT_ATTEMPTS => {
+                continue;
+            }
+            Err(infra) => return Err(infra.into()),
         }
     }
     unreachable!("loop always returns on its last iteration")
@@ -206,9 +224,13 @@ pub async fn probe_table(
     let table_ref = quoted_table_ref(qualified);
 
     tp.select_count = Some(match mode {
-        Mode::Catalog => has_table_priv(tx, qualified, "SELECT").await?,
+        Mode::Catalog => has_table_priv(tx, qualified, "SELECT")
+            .await
+            .context("probe select_count")?,
         Mode::Behavioural => {
-            let (outcome, count) = probe_select_count(tx, qualified).await?;
+            let (outcome, count) = probe_select_count(tx, qualified)
+                .await
+                .context("probe select_count")?;
             if want_row_count {
                 row_count = count;
             }
@@ -218,52 +240,64 @@ pub async fn probe_table(
 
     if insert_probes {
         let insert_outcome = match mode {
-            Mode::Catalog => has_table_priv(tx, qualified, "INSERT").await?,
-            Mode::Behavioural => {
-                probe_dml(tx, &format!("INSERT INTO {table_ref} DEFAULT VALUES")).await?
-            }
+            Mode::Catalog => has_table_priv(tx, qualified, "INSERT")
+                .await
+                .context("probe insert")?,
+            Mode::Behavioural => probe_dml(tx, &format!("INSERT INTO {table_ref} DEFAULT VALUES"))
+                .await
+                .context("probe insert")?,
         };
         tp.insert_returning = Some(match mode {
             Mode::Catalog => {
                 if insert_outcome == Outcome::Allowed {
-                    has_table_priv(tx, qualified, "SELECT").await?
+                    has_table_priv(tx, qualified, "SELECT")
+                        .await
+                        .context("probe insert_returning")?
                 } else {
                     Outcome::DeniedPrivilege
                 }
             }
-            Mode::Behavioural => {
-                probe_dml(
-                    tx,
-                    &format!("INSERT INTO {table_ref} DEFAULT VALUES RETURNING *"),
-                )
-                .await?
-            }
+            Mode::Behavioural => probe_dml(
+                tx,
+                &format!("INSERT INTO {table_ref} DEFAULT VALUES RETURNING *"),
+            )
+            .await
+            .context("probe insert_returning")?,
         });
         tp.insert = Some(insert_outcome);
     }
 
     tp.delete = Some(match mode {
-        Mode::Catalog => has_table_priv(tx, qualified, "DELETE").await?,
-        Mode::Behavioural => probe_dml(tx, &format!("DELETE FROM {table_ref} WHERE false")).await?,
+        Mode::Catalog => has_table_priv(tx, qualified, "DELETE")
+            .await
+            .context("probe delete")?,
+        Mode::Behavioural => probe_dml(tx, &format!("DELETE FROM {table_ref} WHERE false"))
+            .await
+            .context("probe delete")?,
     });
 
     for column in columns.keys() {
         let column_ref = quote_ident(column);
         let select = Some(match mode {
-            Mode::Catalog => has_column_priv(tx, qualified, column, "SELECT").await?,
+            Mode::Catalog => has_column_priv(tx, qualified, column, "SELECT")
+                .await
+                .with_context(|| format!("probe column {column:?} select"))?,
             Mode::Behavioural => {
-                probe_dml(tx, &format!("SELECT {column_ref} FROM {table_ref} LIMIT 0")).await?
+                probe_dml(tx, &format!("SELECT {column_ref} FROM {table_ref} LIMIT 0"))
+                    .await
+                    .with_context(|| format!("probe column {column:?} select"))?
             }
         });
         let update = Some(match mode {
-            Mode::Catalog => has_column_priv(tx, qualified, column, "UPDATE").await?,
-            Mode::Behavioural => {
-                probe_dml(
-                    tx,
-                    &format!("UPDATE {table_ref} SET {column_ref} = {column_ref} WHERE false"),
-                )
-                .await?
-            }
+            Mode::Catalog => has_column_priv(tx, qualified, column, "UPDATE")
+                .await
+                .with_context(|| format!("probe column {column:?} update"))?,
+            Mode::Behavioural => probe_dml(
+                tx,
+                &format!("UPDATE {table_ref} SET {column_ref} = {column_ref} WHERE false"),
+            )
+            .await
+            .with_context(|| format!("probe column {column:?} update"))?,
         });
         tp.columns
             .insert(column.clone(), ColumnPriv { select, update });
@@ -287,13 +321,20 @@ pub async fn probe_function(tx: &RollbackTx, function_sig: &str) -> Result<Outco
 /// the inner `Result`, or the classified [`Outcome`] if the assert query
 /// itself errored (e.g. a malformed assert): that is a soft failure, meant
 /// to be recorded as a finding, not a tool error. The outer `Result` is a
-/// hard failure: the savepoint wrapping this probe could not be discarded,
-/// which is always a tool error regardless of what the assert query did.
+/// hard failure: either the savepoint wrapping this probe could not be
+/// discarded, or the assert query hit an infrastructure failure (see
+/// [`pgcore::classify`]) rather than a legitimate outcome -- both are
+/// always a tool error regardless of what the assert's own logic says.
 pub async fn run_assert(tx: &RollbackTx, sql: &str) -> Result<std::result::Result<i64, Outcome>> {
     let name = next_savepoint_name();
     let sp = match tx.savepoint(&name).await {
         Ok(sp) => sp,
-        Err(e) => return Ok(Err(classify(&e))),
+        Err(e) => {
+            return match classify(&e) {
+                Ok(outcome) => Ok(Err(outcome)),
+                Err(infra) => Err(infra.into()),
+            };
+        }
     };
     let wrapped = format!("SELECT count(*) FROM ({sql}) AS rlsnap_assert");
     match tx.query(&wrapped, &[]).await {
@@ -303,11 +344,14 @@ pub async fn run_assert(tx: &RollbackTx, sql: &str) -> Result<std::result::Resul
             Ok(Ok(count))
         }
         Err(e) => {
-            let outcome = classify(&e);
+            let classified = classify(&e);
             sp.discard()
                 .await
                 .context("discard assert savepoint after error")?;
-            Ok(Err(outcome))
+            match classified {
+                Ok(outcome) => Ok(Err(outcome)),
+                Err(infra) => Err(infra.into()),
+            }
         }
     }
 }

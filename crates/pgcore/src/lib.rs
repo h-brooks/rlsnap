@@ -14,6 +14,6 @@ pub mod txguard;
 
 pub use catalog::{Catalog, CatalogDiff};
 pub use config::{Config, Mode, Target};
-pub use outcome::{classify, Outcome};
+pub use outcome::{classify, InfrastructureError, Outcome};
 pub use persona::{ApplyError, Persona};
 pub use tx::{RollbackTx, Savepoint};
