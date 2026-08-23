@@ -6,8 +6,27 @@ use std::collections::BTreeSet;
 use pgcore::catalog::PolicyInfo;
 use pgcore::Outcome;
 use serde::Serialize;
+use thiserror::Error;
 
 use crate::snapshot::{Finding, Snapshot};
+
+/// Why two snapshots cannot be diffed at all. Distinct from a `SnapshotDiff`
+/// (which describes what changed between two *comparable* snapshots):
+/// diffing an incompatible pair must be a loud error, not a diff that
+/// silently reports "no changes" or, worse, a wall of privilege changes that
+/// are really just an artifact of comparing catalog-mode outcomes against
+/// behavioural-mode ones.
+#[derive(Debug, Error)]
+pub enum DiffError {
+    #[error(
+        "cannot diff snapshots with different format versions ({a} vs {b}) -- re-accept the baseline with the current rlsnap so both sides use the same schema version"
+    )]
+    FormatMismatch { a: u32, b: u32 },
+    #[error(
+        "cannot diff a {a:?}-mode snapshot against a {b:?}-mode snapshot -- probe outcomes are not comparable across modes"
+    )]
+    ModeMismatch { a: String, b: String },
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PrivChange {
@@ -241,11 +260,22 @@ fn diff_functions(a: &Snapshot, b: &Snapshot) -> Vec<FunctionChange> {
     out
 }
 
-fn findings_by_name(findings: &[Finding]) -> BTreeMap<&str, &str> {
-    findings
-        .iter()
-        .map(|f| (f.name.as_str(), f.message.as_str()))
-        .collect()
+/// Group findings by name. A `BTreeMap<&str, &str>` here would silently
+/// collapse two findings sharing a name (an easy copy-paste error in
+/// `[[asserts]]` config, since global names are `assert:{name}` and
+/// per-persona ones are `assert:{name}:{persona}`) to whichever one the
+/// iteration order visited last, making one of them invisible to the diff.
+fn findings_by_name(findings: &[Finding]) -> BTreeMap<&str, Vec<&str>> {
+    let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for f in findings {
+        map.entry(f.name.as_str())
+            .or_default()
+            .push(f.message.as_str());
+    }
+    for messages in map.values_mut() {
+        messages.sort_unstable();
+    }
+    map
 }
 
 fn diff_findings(a: &Snapshot, b: &Snapshot) -> Vec<FindingChange> {
@@ -254,13 +284,13 @@ fn diff_findings(a: &Snapshot, b: &Snapshot) -> Vec<FindingChange> {
     let names: BTreeSet<&str> = fa.keys().chain(fb.keys()).copied().collect();
     let mut out = Vec::new();
     for name in names {
-        let before = fa.get(name).map(|s| s.to_string());
-        let after = fb.get(name).map(|s| s.to_string());
+        let before = fa.get(name);
+        let after = fb.get(name);
         if before != after {
             out.push(FindingChange {
                 name: name.to_string(),
-                before,
-                after,
+                before: before.map(|messages| messages.join("; ")),
+                after: after.map(|messages| messages.join("; ")),
             });
         }
     }
@@ -299,14 +329,31 @@ fn diff_data(a: &Snapshot, b: &Snapshot) -> Vec<DataChange> {
     out
 }
 
-pub fn diff(a: &Snapshot, b: &Snapshot) -> SnapshotDiff {
-    SnapshotDiff {
+/// Compare two snapshots cell-by-cell. Rejects a pair that cannot be
+/// meaningfully compared (mismatched format version, or one catalog-mode and
+/// one behavioural-mode) rather than silently producing a confusing or empty
+/// diff. `target` is intentionally not checked here: diffing snapshots from
+/// two different targets (e.g. preview against prod) is a documented use.
+pub fn diff(a: &Snapshot, b: &Snapshot) -> Result<SnapshotDiff, DiffError> {
+    if a.format != b.format {
+        return Err(DiffError::FormatMismatch {
+            a: a.format,
+            b: b.format,
+        });
+    }
+    if a.mode != b.mode {
+        return Err(DiffError::ModeMismatch {
+            a: a.mode.clone(),
+            b: b.mode.clone(),
+        });
+    }
+    Ok(SnapshotDiff {
         privilege_changes: diff_privileges(a, b),
         policy_changes: diff_policies(a, b),
         function_changes: diff_functions(a, b),
         finding_changes: diff_findings(a, b),
         data_changes: diff_data(a, b),
-    }
+    })
 }
 
 fn outcome_str(o: &Option<Outcome>) -> String {

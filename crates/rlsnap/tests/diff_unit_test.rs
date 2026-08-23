@@ -26,7 +26,7 @@ fn empty_snapshot() -> Snapshot {
 fn identical_snapshots_diff_to_nothing() {
     let a = empty_snapshot();
     let b = a.clone();
-    let d = diff::diff(&a, &b);
+    let d = diff::diff(&a, &b).unwrap();
     assert!(d.is_empty());
     assert_eq!(d.exit_code(false), 0);
     assert_eq!(d.exit_code(true), 0);
@@ -69,7 +69,7 @@ fn column_select_denial_appears_as_privilege_change() {
     persona_after.insert("staff".to_string(), table_after);
     b.privileges.insert("staff".to_string(), persona_after);
 
-    let d = diff::diff(&a, &b);
+    let d = diff::diff(&a, &b).unwrap();
     assert_eq!(d.privilege_changes.len(), 1);
     let c = &d.privilege_changes[0];
     assert_eq!(c.op, "select");
@@ -91,7 +91,7 @@ fn finding_appearing_is_a_diff_regardless_of_strict_data() {
         message: "3 row(s) violate assert".to_string(),
     });
 
-    let d = diff::diff(&a, &b);
+    let d = diff::diff(&a, &b).unwrap();
     assert_eq!(d.finding_changes.len(), 1);
     assert_eq!(d.exit_code(false), 1);
     let rendered = diff::render_table(&d);
@@ -119,7 +119,7 @@ fn data_only_diff_is_gated_by_strict_data() {
         row_counts: per_persona_b,
     });
 
-    let d = diff::diff(&a, &b);
+    let d = diff::diff(&a, &b).unwrap();
     assert_eq!(d.data_changes.len(), 1);
     assert_eq!(
         d.exit_code(false),
@@ -127,6 +127,57 @@ fn data_only_diff_is_gated_by_strict_data() {
         "data changes must not affect exit code by default"
     );
     assert_eq!(d.exit_code(true), 1, "but must with --strict-data");
+}
+
+#[test]
+fn diff_rejects_a_format_version_mismatch_instead_of_reporting_no_changes() {
+    let a = empty_snapshot();
+    let mut b = empty_snapshot();
+    b.format = a.format + 1;
+
+    let err = diff::diff(&a, &b)
+        .expect_err("a format-version mismatch must be a loud error, not a silent \"no changes\"");
+    assert!(matches!(err, diff::DiffError::FormatMismatch { .. }));
+}
+
+#[test]
+fn diff_rejects_a_catalog_vs_behavioural_mode_mismatch() {
+    let a = empty_snapshot();
+    let mut b = empty_snapshot();
+    b.mode = "catalog".to_string();
+
+    let err = diff::diff(&a, &b).expect_err(
+        "diffing a catalog-mode snapshot against a behavioural-mode one must be rejected, \
+         not produce a wall of meaningless privilege changes",
+    );
+    assert!(matches!(err, diff::DiffError::ModeMismatch { .. }));
+}
+
+#[test]
+fn findings_sharing_a_name_do_not_collapse_in_the_diff() {
+    let a = empty_snapshot();
+    let mut b = empty_snapshot();
+    b.findings.push(Finding {
+        name: "assert:x".to_string(),
+        message: "first violation".to_string(),
+    });
+    b.findings.push(Finding {
+        name: "assert:x".to_string(),
+        message: "second violation".to_string(),
+    });
+
+    let d = diff::diff(&a, &b).unwrap();
+    assert_eq!(
+        d.finding_changes.len(),
+        1,
+        "two findings with the same name are still one name-level diff entry"
+    );
+    let after = d.finding_changes[0].after.as_ref().unwrap();
+    assert!(
+        after.contains("first violation") && after.contains("second violation"),
+        "both findings sharing a name must survive into the diff, not have one \
+         silently overwrite the other: got {after:?}"
+    );
 }
 
 #[test]
@@ -138,7 +189,7 @@ fn json_diff_round_trips_through_serde() {
         .or_default()
         .insert("public.myfunc()".to_string(), Outcome::Allowed);
 
-    let d = diff::diff(&a, &b);
+    let d = diff::diff(&a, &b).unwrap();
     let json = diff::render_json(&d);
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value["function_changes"][0]["function"], "public.myfunc()");
