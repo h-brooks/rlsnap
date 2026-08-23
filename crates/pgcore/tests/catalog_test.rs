@@ -82,6 +82,64 @@ async fn diff_names_added_column_and_policy_exactly() {
 }
 
 #[tokio::test]
+async fn snapshot_does_not_error_on_a_schema_containing_an_aggregate() {
+    let db = TestDb::create().await;
+    db.load_fixture(
+        "CREATE FUNCTION widget_sum_sfunc(state int, x int) RETURNS int AS \
+            $$ SELECT state + x $$ LANGUAGE sql IMMUTABLE; \
+         CREATE AGGREGATE widget_sum(int) (SFUNC = widget_sum_sfunc, STYPE = int, INITCOND = '0');",
+    )
+    .await;
+
+    let snap = snapshot_public(&db).await;
+    let key = snap
+        .functions
+        .keys()
+        .find(|k| k.starts_with("public.widget_sum("))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the aggregate in the catalog: {:?}",
+                snap.functions.keys().collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        snap.functions[key].definition.is_none(),
+        "pg_get_functiondef must be skipped for an aggregate, not attempted: {:?}",
+        snap.functions[key].definition
+    );
+
+    db.close().await;
+}
+
+#[tokio::test]
+async fn diff_names_a_changed_function_body() {
+    let db = TestDb::create().await;
+    db.load_fixture(
+        "CREATE FUNCTION is_admin() RETURNS boolean AS $$ SELECT true $$ LANGUAGE sql;",
+    )
+    .await;
+    let before = snapshot_public(&db).await;
+
+    db.load_fixture(
+        "CREATE OR REPLACE FUNCTION is_admin() RETURNS boolean AS $$ SELECT false $$ LANGUAGE sql;",
+    )
+    .await;
+    let after = snapshot_public(&db).await;
+
+    let diff = Catalog::diff(&before, &after);
+    assert!(!diff.is_empty());
+    let changed_paths: Vec<&String> = diff.changed.keys().collect();
+    assert!(
+        changed_paths
+            .iter()
+            .any(|p| p.contains("functions.public.is_admin") && p.ends_with(".definition")),
+        "diff should name the function whose body changed: {changed_paths:?}"
+    );
+
+    db.close().await;
+}
+
+#[tokio::test]
 async fn diff_of_identical_snapshots_is_empty() {
     let db = TestDb::create().await;
     db.load_fixture("CREATE TABLE widgets (id int primary key, name text);")

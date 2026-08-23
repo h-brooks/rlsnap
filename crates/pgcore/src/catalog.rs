@@ -48,6 +48,18 @@ pub struct FunctionInfo {
     pub arguments: String,
     pub returns: String,
     pub security_definer: bool,
+    /// `pg_get_functiondef(oid)`, whitespace-normalised. `None` for an
+    /// aggregate or window function: `pg_get_functiondef` raises an error
+    /// for those (it only knows how to reconstruct plain functions and
+    /// procedures), so it is never called for them rather than caught after
+    /// the fact.
+    pub definition: Option<String>,
+    pub owner: String,
+    /// Raw `pg_proc.provolatile` code: `i` (immutable), `s` (stable), or `v`
+    /// (volatile).
+    pub volatility: String,
+    /// `pg_proc.proconfig` (e.g. `search_path=public`), in declaration order.
+    pub config: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -297,11 +309,17 @@ pub async fn snapshot(
         );
     }
 
-    // Functions.
+    // Functions. `pg_get_functiondef` raises an error for an aggregate or a
+    // window function, which would abort this whole query if called
+    // unconditionally; the CASE only evaluates it for a plain function or
+    // procedure (`prokind` 'f'/'p'), so an aggregate/window row never
+    // reaches it.
     let rows = tx
         .query(
             "SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid), \
-                    pg_get_function_result(p.oid), p.prosecdef \
+                    pg_get_function_result(p.oid), p.prosecdef, \
+                    CASE WHEN p.prokind IN ('f', 'p') THEN pg_get_functiondef(p.oid) END, \
+                    pg_get_userbyid(p.proowner), p.provolatile::text, p.proconfig \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              WHERE n.nspname = ANY($1)",
@@ -314,6 +332,10 @@ pub async fn snapshot(
         let arguments: String = row.get(2);
         let returns: String = row.get(3);
         let security_definer: bool = row.get(4);
+        let definition: Option<String> = row.get(5);
+        let owner: String = row.get(6);
+        let volatility: String = row.get(7);
+        let config: Option<Vec<String>> = row.get(8);
         let key = format!("{schema}.{name}({arguments})");
         catalog.functions.insert(
             key,
@@ -321,6 +343,10 @@ pub async fn snapshot(
                 arguments: normalize_ws(&arguments),
                 returns,
                 security_definer,
+                definition: definition.map(|d| normalize_ws(&d)),
+                owner,
+                volatility,
+                config: config.unwrap_or_default(),
             },
         );
     }
