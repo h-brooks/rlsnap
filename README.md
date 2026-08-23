@@ -1,44 +1,89 @@
 # rlsnap
 
-Snapshot testing for Postgres access control.
+**Snapshot testing for Postgres access control.** Probe every persona × table × column × operation, commit the snapshot, diff it in CI.
 
-Probes every persona × table × column × operation on a Supabase/Postgres database, writes a deterministic snapshot, and diffs it in CI — so a migration that widens or narrows access shows up as a reviewable diff, not a client bug report.
+[![CI](https://github.com/h-brooks/rlsnap/actions/workflows/ci.yml/badge.svg)](https://github.com/h-brooks/rlsnap/actions/workflows/ci.yml)
 
-Status: `rlsnap` implements `init`, `snapshot`, `diff`, `check`, `accept`, and `explain` against real Postgres, in both catalog and behavioural mode. `rehearse` is not implemented yet (it exits 2 with "not implemented"). See `docs/rlsnap-spec.md` for the full design. See issue #1.
+## Why this exists
 
-## Workspace layout
+If your security boundary lives in the database — grants, column privileges, row-level security — then it is invisible to every testing layer you already have. Unit tests don't reach it. Browser tests see a UI that looks fine. The database says nothing when a migration quietly widens or narrows access.
 
-This is a cargo workspace with three crates:
+The same defects keep shipping, everywhere RLS is used:
 
-- **`crates/pgcore`** — the shared library. Config loading (`rlsnap.toml` / `pgkit.toml`), the always-rolls-back probe transaction (`RollbackTx`), persona impersonation, SQLSTATE outcome classification, catalog snapshotting + diffing, and a quote-and-comment-aware SQL statement splitter. This crate is frozen: `rlsnap` and `rehearse` build on it without editing it.
-- **`crates/rlsnap`** — the snapshot/diff CLI described in the spec.
-- **`crates/rehearse`** — a sibling tool for migration rehearsal, sharing the same core. Currently a stub.
+- a migration adds a column, and **nobody re-grants the column-scoped UPDATE** — the UI write breaks for exactly one role
+- `INSERT` works but **`INSERT … RETURNING` fails**, because there's no SELECT policy — the save button errors after the row is in
+- a default-grant pattern hands a **new permission to every role**
+- a "visible rows" helper **drifts from the policy** it's supposed to mirror
+- a function becomes **executable by `anon`** and nobody notices
+- table privileges are checked **before** RLS, so a revoke blanks out a whole section
 
-## Running tests
+None of these fail a test. All of them fail a diff:
 
-Integration tests drive real Postgres — nothing in this repo mocks the database. You need a Postgres 16 server reachable at the URL in `PG_TEST_URL` (default `postgres://postgres:postgres@127.0.0.1:54390/postgres`, superuser access required so tests can create/drop databases and roles).
+```
+$ rlsnap diff before.json after.json
+== table: public.widgets ==
+persona          op        column     before      after
+authenticated    update    id         allowed     denied_privilege
+authenticated    update    price      -           denied_privilege
+authenticated    update    tenant     allowed     denied_privilege
+tenant_a         select    price      -           allowed
 
-Start one locally with:
-
-```sh
-scripts/test-db.sh start   # starts a postgres:16 container on port 54390
-scripts/test-db.sh stop    # tears it down
+exit code 1
 ```
 
-Then:
+## How it works
 
-```sh
-cargo fmt
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
+`rlsnap snapshot` connects to any Postgres (Supabase-first: personas are a role plus `request.jwt.claims`), and probes the full access matrix:
+
+- **catalog mode** (the default for prod targets): `has_table_privilege` / `has_column_privilege` / `has_function_privilege` per persona, plus the literal policy catalog from `pg_policies`. Zero DML — safe to point at production without a second thought.
+- **behavioural mode** (local/preview): real probes — `SELECT count(*)`, per-column `SELECT … LIMIT 0` and `UPDATE t SET col = col WHERE false`, `INSERT DEFAULT VALUES` and `INSERT … RETURNING` — each in its own savepoint, all inside a transaction that **always rolls back**. Outcomes are classified by SQLSTATE: `denied_privilege` vs `denied_rls` vs `constraint` (which proves the permission layer passed — Postgres evaluates RLS `WITH CHECK` before constraints).
+
+The snapshot is deterministic JSON (sorted, timestamp-free, byte-identical across runs and pool sizes) — commit it. `rlsnap check` re-probes and diffs against the baseline; exit 1 on any change. `rlsnap accept` re-baselines after review. `rlsnap explain <persona> <table> <op>` shows the grants and policies behind one cell.
+
+Custom checks generalise into `[[asserts]]` — a named SQL query that must return zero rows, optionally evaluated *inside each persona's impersonated transaction*: tenant disjointness, helper/policy parity, governance allow-lists.
+
+## Install
+
+```
+cargo install --git https://github.com/h-brooks/rlsnap rlsnap
 ```
 
-Each integration test creates its own uniquely-named database on the shared server (`CREATE DATABASE`), bootstraps the Supabase-style `anon` / `authenticated` / `service_role` roles if they don't already exist cluster-wide, loads fixture SQL, runs the assertions, and drops the database again. Tests never rely on a fixed database name and run safely in parallel against the same server.
+## Quick start
 
-CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, and `cargo test --workspace` against a `postgres:16` service container on port 54390.
+```
+rlsnap init                      # writes rlsnap.toml (personas, targets, excludes)
+export RLSNAP_LOCAL_URL=postgres://postgres:postgres@127.0.0.1:54322/postgres
+rlsnap snapshot --target local --out rlsnap.snap.json   # commit this
+rlsnap check --target local      # CI: exit 0 clean / 1 changes / 2 error
+```
 
-## The ROLLBACK-only invariant
+Connection strings come only from environment variables — a literal URL in the config is a hard error, so the file is safe to commit.
 
-`pgcore` never commits. `RollbackTx` issues `BEGIN`, sets `statement_timeout` and `lock_timeout` local to the transaction, and guarantees the transaction ends in `ROLLBACK` — via the documented `finish()` call, or as a best-effort fallback in `Drop` if a caller forgets. Every error path still rolls back. This is enforced both by convention (the only transaction-terminating statement anywhere in `src/` is `ROLLBACK` — grep for `COMMIT` and you'll only find it in the comment explaining this rule) and by an integration test that proves a full probe transaction leaves the target database byte-for-byte unchanged.
+## Safety invariants
 
-This is what makes it safe to point `rlsnap`/`rehearse` at a live database, including production: the tool can read anything and probe anything, but it can never write.
+- The only transaction terminator this workspace ever sends is `ROLLBACK` — enforced by a workspace-wide test, and by an integration test proving a full behavioural run leaves the database byte-identical.
+- `SET LOCAL statement_timeout` / `lock_timeout` on every probe transaction.
+- Known residue: rolled-back `INSERT` probes still advance identity/serial sequences (Postgres doesn't undo that). Documented; `insert_probes = false` per target if it matters.
+
+## Sibling: `rehearse`
+
+Same workspace, same core: run a **migration** against a real database (prod included) inside an always-rolled-back transaction, and get the report — per-statement timing, which relations would be locked and how hard, in-transaction write counts, the full catalog diff, and the exact failing statement. It refuses `COMMIT`/`END` inside migration files, so a stray transaction terminator can't turn a rehearsal into a deploy. `rehearse drift` diffs two databases' schemas — "which migrations are missing on prod" as one command.
+
+```
+$ rehearse run 20260818_add_sku.sql --target staging
+== Locks ==
+public.widgets: AccessExclusiveLock  (would block reads/writes)
+== Writes ==
+public.widgets: ins=0 upd=3 del=0
+== Schema changes ==
++ tables.public.widgets.columns.sku.data_type = text
++ tables.public.widgets.indexes.widgets_sku_idx = CREATE INDEX ...
+```
+
+## What it doesn't do
+
+It doesn't tell you whether a grant is *correct* — only that it *changed*. You review the diff the way you review code. Detection is mechanical; judgment stays with you. Static lints (RLS off, `USING (true)`) are already in Supabase's dashboard advisors — rlsnap doesn't duplicate them; it tests behaviour.
+
+## License
+
+MIT

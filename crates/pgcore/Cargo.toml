@@ -3,6 +3,11 @@ name = "pgcore"
 version = "0.1.0"
 edition = { workspace = true }
 license = { workspace = true }
+description = "Shared Postgres core for rlsnap and rehearse: env-only targets, always-ROLLBACK transactions, persona impersonation, SQLSTATE classification, catalog snapshots"
+repository = "https://github.com/h-brooks/rlsnap"
+keywords = ["postgres", "supabase", "rls", "security", "testing"]
+categories = ["command-line-utilities", "database"]
+
 
 [dependencies]
 serde = { workspace = true }
