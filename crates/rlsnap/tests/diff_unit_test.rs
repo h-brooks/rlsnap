@@ -17,6 +17,7 @@ fn empty_snapshot() -> Snapshot {
         privileges: BTreeMap::new(),
         policies: BTreeMap::new(),
         functions: BTreeMap::new(),
+        function_defs: BTreeMap::new(),
         findings: Vec::new(),
         data: None,
     }

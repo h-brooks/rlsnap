@@ -477,6 +477,133 @@ async fn catalog_mode_target_rejects_with_rows() {
 }
 
 #[tokio::test]
+async fn rls_disabled_but_policies_kept_is_flagged_in_catalog_mode() {
+    let h = TestHarness::new(
+        "CREATE TABLE orders (id int primary key, tenant_id text not null); \
+         ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
+         GRANT SELECT ON orders TO authenticated; \
+         CREATE POLICY orders_tenant ON orders FOR SELECT TO authenticated \
+            USING (tenant_id = current_setting('request.jwt.claim.tenant_id', true));",
+        "schemas = [\"public\"]\n",
+        "catalog",
+        1000,
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "before.json"])
+        .await
+        .unwrap();
+
+    // The policy is left completely untouched, but RLS itself is switched
+    // off: every row is now visible regardless of the policy's USING
+    // clause, and `pg_policies` alone cannot tell you that happened.
+    h.db.load_fixture("ALTER TABLE orders DISABLE ROW LEVEL SECURITY;")
+        .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "after.json"])
+        .await
+        .unwrap();
+
+    let code = h
+        .run(&[
+            "diff",
+            h.path("before.json").to_str().unwrap(),
+            h.path("after.json").to_str().unwrap(),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        code, 1,
+        "disabling RLS while keeping the policy in place must be a reported diff, not silence"
+    );
+
+    let before: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("before.json")).unwrap()).unwrap();
+    let after: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("after.json")).unwrap()).unwrap();
+
+    assert!(before.policies["public.orders"].rls_enabled);
+    assert!(!after.policies["public.orders"].rls_enabled);
+    assert!(
+        after.policies["public.orders"]
+            .policies
+            .contains_key("orders_tenant"),
+        "the policy itself must still be present: DISABLE ROW LEVEL SECURITY never touches it"
+    );
+
+    let d = rlsnap::diff::diff(&before, &after).unwrap();
+    let table = rlsnap::diff::render_table(&d);
+    assert!(
+        table.contains("public.orders"),
+        "diff should name the table: {table}"
+    );
+    assert!(
+        table.contains("rls_enabled"),
+        "diff should name the flag that changed: {table}"
+    );
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn function_body_change_is_named_in_the_diff() {
+    let h = TestHarness::new(
+        "CREATE FUNCTION is_admin() RETURNS boolean AS $$ SELECT true $$ LANGUAGE sql;",
+        "schemas = [\"public\"]\n",
+        "catalog",
+        1000,
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "before.json"])
+        .await
+        .unwrap();
+
+    // Same signature, same grants: only the body (restrictive -> permissive)
+    // changes, which no persona's EXECUTE outcome would ever catch.
+    h.db.load_fixture(
+        "CREATE OR REPLACE FUNCTION is_admin() RETURNS boolean AS $$ SELECT false $$ LANGUAGE sql;",
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "after.json"])
+        .await
+        .unwrap();
+
+    let code = h
+        .run(&[
+            "diff",
+            h.path("before.json").to_str().unwrap(),
+            h.path("after.json").to_str().unwrap(),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(code, 1, "a changed function body must be a reported diff");
+
+    let before: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("before.json")).unwrap()).unwrap();
+    let after: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("after.json")).unwrap()).unwrap();
+
+    let d = rlsnap::diff::diff(&before, &after).unwrap();
+    assert!(
+        d.function_def_changes
+            .iter()
+            .any(|c| c.function.contains("is_admin") && c.field == "definition"),
+        "diff should record the changed function definition: {:?}",
+        d.function_def_changes
+    );
+
+    let table = rlsnap::diff::render_table(&d);
+    assert!(
+        table.contains("is_admin"),
+        "rendered diff should name the function: {table}"
+    );
+
+    h.close().await;
+}
+
+#[tokio::test]
 async fn diff_rejects_a_catalog_snapshot_against_a_behavioural_snapshot_of_the_same_db() {
     let h = TestHarness::new(
         "CREATE TABLE widgets (id int primary key); GRANT SELECT ON widgets TO authenticated;",

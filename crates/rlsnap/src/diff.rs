@@ -3,12 +3,12 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use pgcore::catalog::PolicyInfo;
+use pgcore::catalog::{FunctionInfo, PolicyInfo};
 use pgcore::Outcome;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::snapshot::{Finding, Snapshot};
+use crate::snapshot::{Finding, Snapshot, TablePolicies};
 
 /// Why two snapshots cannot be diffed at all. Distinct from a `SnapshotDiff`
 /// (which describes what changed between two *comparable* snapshots):
@@ -56,6 +56,14 @@ pub struct FunctionChange {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct FunctionDefChange {
+    pub function: String,
+    pub field: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct FindingChange {
     pub name: String,
     pub before: Option<String>,
@@ -72,6 +80,7 @@ pub struct SnapshotDiff {
     pub privilege_changes: Vec<PrivChange>,
     pub policy_changes: Vec<PolicyChange>,
     pub function_changes: Vec<FunctionChange>,
+    pub function_def_changes: Vec<FunctionDefChange>,
     pub finding_changes: Vec<FindingChange>,
     pub data_changes: Vec<DataChange>,
 }
@@ -82,6 +91,7 @@ impl SnapshotDiff {
         let core_changed = !self.privilege_changes.is_empty()
             || !self.policy_changes.is_empty()
             || !self.function_changes.is_empty()
+            || !self.function_def_changes.is_empty()
             || !self.finding_changes.is_empty();
         let data_changed = strict_data && !self.data_changes.is_empty();
         if core_changed || data_changed {
@@ -95,6 +105,7 @@ impl SnapshotDiff {
         self.privilege_changes.is_empty()
             && self.policy_changes.is_empty()
             && self.function_changes.is_empty()
+            && self.function_def_changes.is_empty()
             && self.finding_changes.is_empty()
             && self.data_changes.is_empty()
     }
@@ -195,9 +206,36 @@ fn policy_field(p: &PolicyInfo, field: &str) -> String {
 fn diff_policies(a: &Snapshot, b: &Snapshot) -> Vec<PolicyChange> {
     let mut out = Vec::new();
     for table in union_keys(&a.policies, &b.policies) {
-        let empty = BTreeMap::new();
-        let pa = a.policies.get(table).unwrap_or(&empty);
-        let pb = b.policies.get(table).unwrap_or(&empty);
+        let empty = TablePolicies::default();
+        let ta = a.policies.get(table).unwrap_or(&empty);
+        let tb = b.policies.get(table).unwrap_or(&empty);
+
+        // `ALTER TABLE ... {ENABLE,DISABLE} ROW LEVEL SECURITY` (and
+        // `FORCE`/`NO FORCE`) never touch `pg_policies`, so a policy's own
+        // fields can be byte-identical before and after while access
+        // changed completely; these two flags must be compared alongside
+        // the policy list itself, not just carried through unread.
+        if ta.rls_enabled != tb.rls_enabled {
+            out.push(PolicyChange {
+                table: table.to_string(),
+                policy: "(rls)".to_string(),
+                field: "rls_enabled".to_string(),
+                before: Some(ta.rls_enabled.to_string()),
+                after: Some(tb.rls_enabled.to_string()),
+            });
+        }
+        if ta.rls_forced != tb.rls_forced {
+            out.push(PolicyChange {
+                table: table.to_string(),
+                policy: "(rls)".to_string(),
+                field: "rls_forced".to_string(),
+                before: Some(ta.rls_forced.to_string()),
+                after: Some(tb.rls_forced.to_string()),
+            });
+        }
+
+        let pa = &ta.policies;
+        let pb = &tb.policies;
         for policy in union_keys(pa, pb) {
             match (pa.get(policy), pb.get(policy)) {
                 (Some(x), Some(y)) => {
@@ -257,6 +295,57 @@ fn diff_functions(a: &Snapshot, b: &Snapshot) -> Vec<FunctionChange> {
         }
     }
     out.sort_by(|x, y| (&x.function, &x.persona).cmp(&(&y.function, &y.persona)));
+    out
+}
+
+fn function_def_field(f: &FunctionInfo, field: &str) -> String {
+    match field {
+        "definition" => f.definition.clone().unwrap_or_default(),
+        "owner" => f.owner.clone(),
+        "volatility" => f.volatility.clone(),
+        "config" => f.config.join(","),
+        _ => unreachable!(),
+    }
+}
+
+/// Diff function definitions (body, owner, volatility, config), which do not
+/// show up in `function_changes` at all: that section only tracks EXECUTE
+/// outcomes per persona, so a helper's body changing from restrictive to
+/// permissive (with EXECUTE left untouched) would otherwise be invisible.
+fn diff_function_defs(a: &Snapshot, b: &Snapshot) -> Vec<FunctionDefChange> {
+    let mut out = Vec::new();
+    for function in union_keys(&a.function_defs, &b.function_defs) {
+        match (a.function_defs.get(function), b.function_defs.get(function)) {
+            (Some(x), Some(y)) => {
+                for field in ["definition", "owner", "volatility", "config"] {
+                    let fa = function_def_field(x, field);
+                    let fb = function_def_field(y, field);
+                    if fa != fb {
+                        out.push(FunctionDefChange {
+                            function: function.to_string(),
+                            field: field.to_string(),
+                            before: Some(fa),
+                            after: Some(fb),
+                        });
+                    }
+                }
+            }
+            (Some(_), None) => out.push(FunctionDefChange {
+                function: function.to_string(),
+                field: "(function)".to_string(),
+                before: Some("present".to_string()),
+                after: None,
+            }),
+            (None, Some(_)) => out.push(FunctionDefChange {
+                function: function.to_string(),
+                field: "(function)".to_string(),
+                before: None,
+                after: Some("present".to_string()),
+            }),
+            (None, None) => unreachable!(),
+        }
+    }
+    out.sort_by(|x, y| (&x.function, &x.field).cmp(&(&y.function, &y.field)));
     out
 }
 
@@ -351,6 +440,7 @@ pub fn diff(a: &Snapshot, b: &Snapshot) -> Result<SnapshotDiff, DiffError> {
         privilege_changes: diff_privileges(a, b),
         policy_changes: diff_policies(a, b),
         function_changes: diff_functions(a, b),
+        function_def_changes: diff_function_defs(a, b),
         finding_changes: diff_findings(a, b),
         data_changes: diff_data(a, b),
     })
@@ -424,6 +514,21 @@ pub fn render_table(d: &SnapshotDiff) -> String {
                 c.function,
                 outcome_str(&c.before),
                 outcome_str(&c.after),
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !d.function_def_changes.is_empty() {
+        out.push_str("== function definitions ==\n");
+        out.push_str("function                         field        before -> after\n");
+        for c in &d.function_def_changes {
+            out.push_str(&format!(
+                "{:<32} {:<12} {} -> {}\n",
+                c.function,
+                c.field,
+                c.before.clone().unwrap_or_else(|| "-".to_string()),
+                c.after.clone().unwrap_or_else(|| "-".to_string()),
             ));
         }
         out.push('\n');

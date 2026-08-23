@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use pgcore::catalog::{self, ColumnInfo, PolicyInfo};
+use pgcore::catalog::{self, ColumnInfo, FunctionInfo, PolicyInfo};
 use pgcore::config::Mode;
 use pgcore::{Outcome, Persona, RollbackTx};
 
@@ -17,7 +17,11 @@ use crate::config::{AssertCfg, RlsnapConfig};
 use crate::glob::any_match;
 use crate::probe;
 
-pub const FORMAT_VERSION: u32 = 1;
+/// Snapshot format 2 added `policies[table].rls_enabled`/`rls_forced`
+/// (format 1 recorded only the policy list, silently losing an `ALTER TABLE
+/// ... DISABLE ROW LEVEL SECURITY` that leaves the policies themselves
+/// untouched) and the `function_defs` section.
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ColumnPriv {
@@ -47,6 +51,19 @@ pub struct DataSection {
     pub row_counts: BTreeMap<String, BTreeMap<String, i64>>,
 }
 
+/// A table's row-level-security posture: whether RLS is on at all, whether
+/// it is forced even for the table owner, and the policies defined on it.
+/// Keeping `rls_enabled`/`rls_forced` alongside `policies` (rather than
+/// dropping them) matters because `ALTER TABLE ... DISABLE ROW LEVEL
+/// SECURITY` leaves every policy row in `pg_policies` untouched: a snapshot
+/// that recorded only the policy list would see no diff at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TablePolicies {
+    pub rls_enabled: bool,
+    pub rls_forced: bool,
+    pub policies: BTreeMap<String, PolicyInfo>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub format: u32,
@@ -55,10 +72,14 @@ pub struct Snapshot {
     pub mode: String,
     /// persona -> table -> privileges.
     pub privileges: BTreeMap<String, BTreeMap<String, TablePriv>>,
-    /// table -> policy name -> policy.
-    pub policies: BTreeMap<String, BTreeMap<String, PolicyInfo>>,
+    /// table -> RLS flags and policies.
+    pub policies: BTreeMap<String, TablePolicies>,
     /// persona -> function signature -> EXECUTE outcome.
     pub functions: BTreeMap<String, BTreeMap<String, Outcome>>,
+    /// function signature -> definition/owner/volatility/config, so a
+    /// changed function body (or owner, volatility, search_path) is visible
+    /// even when it doesn't change any persona's EXECUTE outcome.
+    pub function_defs: BTreeMap<String, FunctionInfo>,
     pub findings: Vec<Finding>,
     pub data: Option<DataSection>,
 }
@@ -225,11 +246,27 @@ pub async fn build_snapshot(
         .await
         .context("finish discovery transaction")?;
 
-    let policies: BTreeMap<String, BTreeMap<String, PolicyInfo>> = catalog
+    let policies: BTreeMap<String, TablePolicies> = catalog
         .tables
         .iter()
         .filter(|(name, _)| !any_match(&config.excludes, name))
-        .map(|(name, info)| (name.clone(), info.policies.clone()))
+        .map(|(name, info)| {
+            (
+                name.clone(),
+                TablePolicies {
+                    rls_enabled: info.rls_enabled,
+                    rls_forced: info.rls_forced,
+                    policies: info.policies.clone(),
+                },
+            )
+        })
+        .collect();
+
+    let function_defs: BTreeMap<String, FunctionInfo> = catalog
+        .functions
+        .iter()
+        .filter(|(sig, _)| !any_match(&config.excludes, function_bare_name(sig)))
+        .map(|(sig, info)| (sig.clone(), info.clone()))
         .collect();
 
     let filtered_tables: Vec<(String, BTreeMap<String, ColumnInfo>)> = catalog
@@ -325,6 +362,7 @@ pub async fn build_snapshot(
         privileges,
         policies,
         functions: functions_out,
+        function_defs,
         findings,
         data,
     })
