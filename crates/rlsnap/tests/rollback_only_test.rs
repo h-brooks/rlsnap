@@ -67,13 +67,22 @@ fn commit_never_appears_outside_a_comment() {
     }
     assert!(!files.is_empty(), "expected to find .rs files under src/");
 
+    // One deliberate exception: `crates/rehearse/src/migrate.rs` contains the
+    // guard that REFUSES transaction-control statements found inside a
+    // migration file. Detecting and naming `COMMIT` in code and error
+    // messages is that module's entire job; it never sends the statement.
+    // Its behaviour is pinned by rehearse's own tests
+    // (`transaction_control_violation`, and the integration test proving a
+    // migration containing COMMIT is refused with the database unchanged).
+    let allowlisted = |file: &Path| file.ends_with("rehearse/src/migrate.rs");
+
     for file in files {
         let text = std::fs::read_to_string(&file).unwrap();
         for (lineno, line) in text.lines().enumerate() {
             if line.contains("COMMIT") {
                 let trimmed = line.trim_start();
                 assert!(
-                    trimmed.starts_with("//"),
+                    trimmed.starts_with("//") || allowlisted(&file),
                     "found \"COMMIT\" outside a comment at {}:{}: {line}",
                     file.display(),
                     lineno + 1
