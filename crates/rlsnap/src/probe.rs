@@ -1,6 +1,8 @@
 //! Per-cell probes: catalog-mode privilege checks (`has_table_privilege` &
-//! friends) and behavioural-mode actual DML, each wrapped so a denial never
-//! poisons the rest of the persona's transaction.
+//! friends) and behavioural-mode actual DML, each wrapped in its own
+//! savepoint so an error (denial, timeout, or otherwise) never poisons the
+//! rest of the persona's transaction, and retried on a statement timeout so
+//! output stays deterministic across runs (see [`is_statement_timeout`]).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,87 +31,133 @@ fn quoted_table_ref(qualified: &str) -> String {
     }
 }
 
+/// A statement-timeout error (57014) is wall-clock dependent, not an
+/// access-control verdict: it says nothing about whether the persona can
+/// perform the operation, only that this attempt didn't finish in time. Left
+/// unretried, a probe that occasionally lands on either side of the timeout
+/// boundary makes the whole snapshot non-deterministic across otherwise
+/// identical runs. Retry a bounded number of times before accepting one as
+/// final, so a run against an unchanged database converges to the same
+/// answer: allowed/denied if the probe can complete within budget on any
+/// attempt, or a consistent timeout error if it never can.
+const MAX_TIMEOUT_ATTEMPTS: u32 = 3;
+
+fn is_statement_timeout(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Error { sqlstate, .. } if sqlstate == "57014")
+}
+
 /// Run a boolean ACL-check function (`has_table_privilege`,
 /// `has_column_privilege`, `has_function_privilege`) and translate the
-/// result into an [`Outcome`]. These never touch table data.
-async fn bool_check(
+/// result into an [`Outcome`]. These never touch table data. Wrapped in its
+/// own savepoint so a lookup error (e.g. a relation that doesn't resolve)
+/// cannot poison the rest of the persona's transaction, and retried on a
+/// statement timeout for determinism (see [`is_statement_timeout`]).
+pub(crate) async fn bool_check(
     tx: &RollbackTx,
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Outcome {
-    match tx.query(sql, params).await {
-        Ok(rows) => {
-            let ok: bool = rows[0].get(0);
-            if ok {
-                Outcome::Allowed
-            } else {
-                Outcome::DeniedPrivilege
-            }
+    for attempt in 0..MAX_TIMEOUT_ATTEMPTS {
+        let name = next_savepoint_name();
+        let outcome = match tx.savepoint(&name).await {
+            Ok(sp) => match tx.query(sql, params).await {
+                Ok(rows) => {
+                    let ok: bool = rows[0].get(0);
+                    let _ = sp.release().await;
+                    if ok {
+                        Outcome::Allowed
+                    } else {
+                        Outcome::DeniedPrivilege
+                    }
+                }
+                Err(e) => {
+                    let outcome = classify(&e);
+                    let _ = sp.rollback_to().await;
+                    outcome
+                }
+            },
+            Err(e) => classify(&e),
+        };
+        if !is_statement_timeout(&outcome) || attempt + 1 == MAX_TIMEOUT_ATTEMPTS {
+            return outcome;
         }
-        Err(e) => classify(&e),
     }
+    unreachable!("loop always returns on its last iteration")
 }
 
-async fn has_table_priv(tx: &RollbackTx, qualified: &str, priv_: &str) -> Outcome {
+pub(crate) async fn has_table_priv(tx: &RollbackTx, qualified: &str, priv_: &str) -> Outcome {
+    let table_ref = quoted_table_ref(qualified);
     bool_check(
         tx,
         "SELECT has_table_privilege($1, $2)",
-        &[&qualified, &priv_],
+        &[&table_ref, &priv_],
     )
     .await
 }
 
 async fn has_column_priv(tx: &RollbackTx, qualified: &str, column: &str, priv_: &str) -> Outcome {
+    let table_ref = quoted_table_ref(qualified);
     bool_check(
         tx,
         "SELECT has_column_privilege($1, $2, $3)",
-        &[&qualified, &column, &priv_],
+        &[&table_ref, &column, &priv_],
     )
     .await
 }
 
 /// Run `sql` as a one-off DML probe inside its own savepoint: on error, the
 /// savepoint is rolled back so the outer transaction stays usable for the
-/// next probe; on success it is released.
+/// next probe; on success it is released. Retried on a statement timeout
+/// (see [`is_statement_timeout`]).
 async fn probe_dml(tx: &RollbackTx, sql: &str) -> Outcome {
-    let name = next_savepoint_name();
-    let sp = match tx.savepoint(&name).await {
-        Ok(sp) => sp,
-        Err(e) => return classify(&e),
-    };
-    match tx.execute(sql, &[]).await {
-        Ok(_) => {
-            let _ = sp.release().await;
-            Outcome::Allowed
-        }
-        Err(e) => {
-            let outcome = classify(&e);
-            let _ = sp.rollback_to().await;
-            outcome
+    for attempt in 0..MAX_TIMEOUT_ATTEMPTS {
+        let name = next_savepoint_name();
+        let outcome = match tx.savepoint(&name).await {
+            Ok(sp) => match tx.execute(sql, &[]).await {
+                Ok(_) => {
+                    let _ = sp.release().await;
+                    Outcome::Allowed
+                }
+                Err(e) => {
+                    let outcome = classify(&e);
+                    let _ = sp.rollback_to().await;
+                    outcome
+                }
+            },
+            Err(e) => classify(&e),
+        };
+        if !is_statement_timeout(&outcome) || attempt + 1 == MAX_TIMEOUT_ATTEMPTS {
+            return outcome;
         }
     }
+    unreachable!("loop always returns on its last iteration")
 }
 
 /// Like [`probe_dml`] but also returns the `count(*)` value on success.
 async fn probe_select_count(tx: &RollbackTx, qualified: &str) -> (Outcome, Option<i64>) {
-    let name = next_savepoint_name();
-    let sp = match tx.savepoint(&name).await {
-        Ok(sp) => sp,
-        Err(e) => return (classify(&e), None),
-    };
     let sql = format!("SELECT count(*) FROM {}", quoted_table_ref(qualified));
-    match tx.query(&sql, &[]).await {
-        Ok(rows) => {
-            let count: i64 = rows[0].get(0);
-            let _ = sp.release().await;
-            (Outcome::Allowed, Some(count))
-        }
-        Err(e) => {
-            let outcome = classify(&e);
-            let _ = sp.rollback_to().await;
-            (outcome, None)
+    for attempt in 0..MAX_TIMEOUT_ATTEMPTS {
+        let name = next_savepoint_name();
+        let (outcome, count) = match tx.savepoint(&name).await {
+            Ok(sp) => match tx.query(&sql, &[]).await {
+                Ok(rows) => {
+                    let count: i64 = rows[0].get(0);
+                    let _ = sp.release().await;
+                    (Outcome::Allowed, Some(count))
+                }
+                Err(e) => {
+                    let outcome = classify(&e);
+                    let _ = sp.rollback_to().await;
+                    (outcome, None)
+                }
+            },
+            Err(e) => (classify(&e), None),
+        };
+        if !is_statement_timeout(&outcome) || attempt + 1 == MAX_TIMEOUT_ATTEMPTS {
+            return (outcome, count);
         }
     }
+    unreachable!("loop always returns on its last iteration")
 }
 
 /// Probe every operation on one table for the currently-impersonated
