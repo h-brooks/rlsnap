@@ -7,9 +7,20 @@ mod support;
 
 use support::TestHarness;
 
+// Every column has a default (an identity `id`, and defaults on the two
+// NOT NULL columns), so `INSERT INTO widgets DEFAULT VALUES` genuinely
+// succeeds -- and the default `owner` matches the `staff` persona's own
+// claim, so INSERT...RETURNING succeeds too. That is deliberate: a table
+// where the insert probe can only ever fail on a constraint before writing
+// anything would make the no-mutation proof below pass unconditionally,
+// even if ROLLBACK were replaced with COMMIT.
 const FIXTURE_SQL: &str = "\
-    CREATE TABLE widgets (id int primary key, name text not null, owner text); \
-    INSERT INTO widgets VALUES (1, 'a', 'staff-1'), (2, 'b', 'staff-1'); \
+    CREATE TABLE widgets ( \
+        id bigint generated always as identity primary key, \
+        name text not null default 'x', \
+        owner text not null default 'staff-1' \
+    ); \
+    INSERT INTO widgets (name, owner) VALUES ('a', 'staff-1'), ('b', 'staff-1'); \
     ALTER TABLE widgets ENABLE ROW LEVEL SECURITY; \
     GRANT SELECT, INSERT, UPDATE, DELETE ON widgets TO authenticated; \
     CREATE POLICY widgets_all ON widgets FOR ALL TO authenticated \
@@ -67,6 +78,23 @@ async fn full_behavioural_snapshot_leaves_the_database_byte_identical() {
         .await
         .unwrap();
     assert_eq!(code, 0);
+
+    // The proof below (row count and content hash unchanged) is only
+    // meaningful if a real insert actually happened and was rolled back --
+    // confirm that directly, so this test cannot pass vacuously.
+    let snap: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("snap.json")).unwrap()).unwrap();
+    let table = &snap.privileges["staff"]["public.widgets"];
+    assert_eq!(
+        table.insert,
+        Some(pgcore::Outcome::Allowed),
+        "fixture bug: the insert probe must succeed for this proof to test anything"
+    );
+    assert_eq!(
+        table.insert_returning,
+        Some(pgcore::Outcome::Allowed),
+        "fixture bug: insert...returning must succeed for this proof to test anything"
+    );
 
     let after = fingerprint(&h).await;
     assert_eq!(
