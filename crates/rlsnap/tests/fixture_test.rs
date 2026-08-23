@@ -1,0 +1,413 @@
+//! The incident-class fixture catalogue: each test is a before/after schema
+//! pair and asserts that `rlsnap diff`'s table output names the problem.
+//!
+//! Every test drives the real `rlsnap::run` seam end to end against a fresh
+//! Postgres database -- no mocking.
+
+mod support;
+
+use support::TestHarness;
+
+const STAFF_PERSONA: &str = r#"
+[[personas]]
+name = "staff"
+role = "authenticated"
+claims = { sub = "staff-1" }
+"#;
+
+#[tokio::test]
+async fn missing_column_grant_shows_as_denied_privilege() {
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id int primary key, name text not null); \
+         GRANT SELECT, UPDATE ON widgets TO authenticated;",
+        &format!("schemas = [\"public\"]\n{STAFF_PERSONA}"),
+        "behavioural",
+        1000,
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "before.json"])
+        .await
+        .unwrap();
+
+    // A migration adds a column but forgets its column-scoped UPDATE grant.
+    h.db.load_fixture("ALTER TABLE widgets ADD COLUMN owner text;")
+        .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "after.json"])
+        .await
+        .unwrap();
+
+    let code = h
+        .run(&[
+            "diff",
+            h.path("before.json").to_str().unwrap(),
+            h.path("after.json").to_str().unwrap(),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(code, 1);
+
+    // Re-run capturing stdout is awkward through the library seam (it
+    // prints directly), so assert on the JSON diff via the files instead.
+    let before: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("before.json")).unwrap()).unwrap();
+    let after: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("after.json")).unwrap()).unwrap();
+    let d = rlsnap::diff::diff(&before, &after);
+    let table = rlsnap::diff::render_table(&d);
+    assert!(
+        table.contains("denied_privilege"),
+        "expected a denied_privilege cell for the new column, got:\n{table}"
+    );
+    assert!(table.contains("owner"));
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn insert_allowed_but_returning_denied_are_distinct_outcomes() {
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id serial primary key, name text); \
+         ALTER TABLE widgets ENABLE ROW LEVEL SECURITY; \
+         GRANT INSERT ON widgets TO authenticated; \
+         GRANT USAGE, SELECT ON SEQUENCE widgets_id_seq TO authenticated; \
+         CREATE POLICY widgets_insert ON widgets FOR INSERT TO authenticated WITH CHECK (true);",
+        &format!("schemas = [\"public\"]\n{STAFF_PERSONA}"),
+        "behavioural",
+        1000,
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "snap.json"])
+        .await
+        .unwrap();
+    let snap: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("snap.json")).unwrap()).unwrap();
+
+    let table = snap
+        .privileges
+        .get("staff")
+        .unwrap()
+        .get("public.widgets")
+        .unwrap();
+    assert_eq!(table.insert, Some(pgcore::Outcome::Allowed));
+    assert_ne!(
+        table.insert_returning,
+        Some(pgcore::Outcome::Allowed),
+        "RETURNING must be denied without a SELECT policy: {:?}",
+        table.insert_returning
+    );
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn policy_text_change_with_unchanged_outcomes_appears_under_policies() {
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id int primary key, owner text); \
+         INSERT INTO widgets VALUES (1, 'staff-1'); \
+         ALTER TABLE widgets ENABLE ROW LEVEL SECURITY; \
+         GRANT SELECT ON widgets TO authenticated; \
+         CREATE POLICY widgets_select ON widgets FOR SELECT TO authenticated USING (true);",
+        &format!("schemas = [\"public\"]\n{STAFF_PERSONA}"),
+        "behavioural",
+        1000,
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "before.json"])
+        .await
+        .unwrap();
+
+    h.db.load_fixture(
+        "DROP POLICY widgets_select ON widgets; \
+         CREATE POLICY widgets_select ON widgets FOR SELECT TO authenticated USING (owner = owner);",
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "after.json"])
+        .await
+        .unwrap();
+
+    let before: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("before.json")).unwrap()).unwrap();
+    let after: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("after.json")).unwrap()).unwrap();
+
+    // Both policies always evaluate true, so no persona's outcome changes.
+    assert_eq!(before.privileges, after.privileges);
+
+    let d = rlsnap::diff::diff(&before, &after);
+    assert!(d.privilege_changes.is_empty());
+    assert_eq!(d.policy_changes.len(), 1);
+    assert_eq!(d.policy_changes[0].field, "qual");
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn function_newly_executable_by_anon() {
+    let h = TestHarness::new(
+        "CREATE FUNCTION visible_ids() RETURNS setof int AS $$ SELECT 1 $$ LANGUAGE sql; \
+         REVOKE ALL ON FUNCTION visible_ids() FROM public;",
+        "schemas = [\"public\"]\n",
+        "behavioural",
+        1000,
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "before.json"])
+        .await
+        .unwrap();
+
+    h.db.load_fixture("GRANT EXECUTE ON FUNCTION visible_ids() TO anon;")
+        .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "after.json"])
+        .await
+        .unwrap();
+
+    let before: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("before.json")).unwrap()).unwrap();
+    let after: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("after.json")).unwrap()).unwrap();
+    let d = rlsnap::diff::diff(&before, &after);
+
+    assert!(d.function_changes.iter().any(|c| c.persona == "anon"
+        && c.before == Some(pgcore::Outcome::DeniedPrivilege)
+        && c.after == Some(pgcore::Outcome::Allowed)));
+
+    let table = rlsnap::diff::render_table(&d);
+    assert!(table.contains("visible_ids"));
+    assert!(table.contains("allowed"));
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn table_privilege_revoked_flips_all_cells_for_that_persona_to_denied_privilege() {
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id int primary key, name text); \
+         ALTER TABLE widgets ENABLE ROW LEVEL SECURITY; \
+         GRANT SELECT, UPDATE, DELETE ON widgets TO authenticated; \
+         CREATE POLICY widgets_all ON widgets FOR ALL TO authenticated USING (true) WITH CHECK (true);",
+        &format!("schemas = [\"public\"]\n{STAFF_PERSONA}"),
+        "behavioural",
+        1000,
+    )
+    .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "before.json"])
+        .await
+        .unwrap();
+
+    // Table privilege is checked before RLS: revoking it must make the
+    // table invisible outright, not merely RLS-denied.
+    h.db.load_fixture("REVOKE ALL ON widgets FROM authenticated;")
+        .await;
+
+    h.run(&["snapshot", "--target", "test", "--out", "after.json"])
+        .await
+        .unwrap();
+
+    let after: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("after.json")).unwrap()).unwrap();
+    let table = after
+        .privileges
+        .get("staff")
+        .unwrap()
+        .get("public.widgets")
+        .unwrap();
+    assert_eq!(table.select_count, Some(pgcore::Outcome::DeniedPrivilege));
+    assert_eq!(table.delete, Some(pgcore::Outcome::DeniedPrivilege));
+    for cp in table.columns.values() {
+        assert_eq!(cp.select, Some(pgcore::Outcome::DeniedPrivilege));
+        assert_eq!(cp.update, Some(pgcore::Outcome::DeniedPrivilege));
+    }
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn cap_warning_fires_when_persona_sees_more_than_max_rows() {
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id int primary key); \
+         INSERT INTO widgets SELECT generate_series(1, 10); \
+         GRANT SELECT ON widgets TO authenticated;",
+        &format!("schemas = [\"public\"]\n{STAFF_PERSONA}"),
+        "behavioural",
+        5,
+    )
+    .await;
+
+    h.run(&[
+        "snapshot",
+        "--target",
+        "test",
+        "--out",
+        "snap.json",
+        "--with-rows",
+    ])
+    .await
+    .unwrap();
+    let snap: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("snap.json")).unwrap()).unwrap();
+
+    assert_eq!(
+        snap.data.as_ref().unwrap().row_counts["staff"]["public.widgets"],
+        10
+    );
+    assert!(
+        snap.findings
+            .iter()
+            .any(|f| f.name == "cap:staff:public.widgets"),
+        "expected a cap finding, got: {:?}",
+        snap.findings
+    );
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn tenant_disjointness_assert_fails_after_a_bad_policy_change() {
+    let personas = r#"
+        [[personas]]
+        name = "tenant_a"
+        role = "authenticated"
+        claims = { tenant_id = "a" }
+
+        [[personas]]
+        name = "tenant_b"
+        role = "authenticated"
+        claims = { tenant_id = "b" }
+    "#;
+    let asserts = r#"
+        [[asserts]]
+        name = "tenant_disjointness"
+        sql = "SELECT id FROM widgets WHERE tenant_id <> current_setting('request.jwt.claim.tenant_id', true)"
+        per_persona = true
+    "#;
+
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id int primary key, tenant_id text not null); \
+         INSERT INTO widgets VALUES (1, 'a'), (2, 'b'); \
+         ALTER TABLE widgets ENABLE ROW LEVEL SECURITY; \
+         GRANT SELECT ON widgets TO authenticated, anon, service_role; \
+         CREATE POLICY widgets_tenant ON widgets FOR SELECT TO authenticated \
+            USING (tenant_id = current_setting('request.jwt.claim.tenant_id', true));",
+        &format!("schemas = [\"public\"]\n{personas}\n{asserts}"),
+        "behavioural",
+        1000,
+    )
+    .await;
+
+    h.run(&[
+        "snapshot",
+        "--target",
+        "test",
+        "--out",
+        "before.json",
+        "--with-rows",
+    ])
+    .await
+    .unwrap();
+    let before: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("before.json")).unwrap()).unwrap();
+    assert!(
+        before.findings.is_empty(),
+        "no violations expected before the bad migration: {:?}",
+        before.findings
+    );
+
+    // A migration widens the policy so every tenant sees every row.
+    h.db.load_fixture(
+        "DROP POLICY widgets_tenant ON widgets; \
+         CREATE POLICY widgets_tenant ON widgets FOR SELECT TO authenticated USING (true);",
+    )
+    .await;
+
+    h.run(&[
+        "snapshot",
+        "--target",
+        "test",
+        "--out",
+        "after.json",
+        "--with-rows",
+    ])
+    .await
+    .unwrap();
+    let after: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("after.json")).unwrap()).unwrap();
+    assert!(
+        after
+            .findings
+            .iter()
+            .any(|f| f.name.starts_with("assert:tenant_disjointness")),
+        "expected a tenant_disjointness violation, got: {:?}",
+        after.findings
+    );
+
+    let d = rlsnap::diff::diff(&before, &after);
+    assert!(!d.finding_changes.is_empty());
+    assert_eq!(d.exit_code(false), 1);
+    let table = rlsnap::diff::render_table(&d);
+    assert!(table.contains("tenant_disjointness"));
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn check_then_accept_round_trips_to_zero_exit_code() {
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id int primary key); GRANT SELECT ON widgets TO authenticated;",
+        &format!("schemas = [\"public\"]\n{STAFF_PERSONA}"),
+        "behavioural",
+        1000,
+    )
+    .await;
+
+    // No baseline yet: check must fail loudly, not silently pass.
+    let err = h.run(&["check", "--target", "test"]).await;
+    assert!(err.is_err());
+
+    let code = h.run(&["accept", "--target", "test"]).await.unwrap();
+    assert_eq!(code, 0);
+    assert!(h.path("rlsnap.snap.json").is_file());
+
+    let code = h.run(&["check", "--target", "test"]).await.unwrap();
+    assert_eq!(code, 0, "check right after accept must report no changes");
+
+    // Widen a grant; check must now report a change with exit code 1.
+    h.db.load_fixture("GRANT UPDATE ON widgets TO authenticated;")
+        .await;
+    let code = h.run(&["check", "--target", "test"]).await.unwrap();
+    assert_eq!(code, 1);
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn catalog_mode_target_rejects_with_rows() {
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id int primary key);",
+        "schemas = [\"public\"]\n",
+        "catalog",
+        1000,
+    )
+    .await;
+
+    let result = h
+        .run(&[
+            "snapshot",
+            "--target",
+            "test",
+            "--out",
+            "snap.json",
+            "--with-rows",
+        ])
+        .await;
+    assert!(result.is_err(), "catalog targets must reject --with-rows");
+
+    h.close().await;
+}
