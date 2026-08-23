@@ -1,6 +1,8 @@
 //! Statement splitter: aware of quoting and comments, so a semicolon inside
 //! a string literal, a comment, or a dollar-quoted function body does not
-//! split the statement.
+//! split the statement. Block comments nest (`/* outer /* inner */ still
+//! comment */` is one comment, matching PostgreSQL), tracked with a depth
+//! counter.
 
 #[derive(PartialEq)]
 enum State {
@@ -21,6 +23,7 @@ pub fn split(sql: &str) -> Vec<String> {
     let mut current = String::new();
     let mut state = State::Top;
     let mut dollar_tag = String::new();
+    let mut comment_depth: u32 = 0;
     let mut i = 0;
 
     while i < chars.len() {
@@ -42,6 +45,7 @@ pub fn split(sql: &str) -> Vec<String> {
                     i += 2;
                 } else if c == '/' && chars.get(i + 1) == Some(&'*') {
                     state = State::BlockComment;
+                    comment_depth = 1;
                     current.push(c);
                     current.push('*');
                     i += 2;
@@ -99,13 +103,24 @@ pub fn split(sql: &str) -> Vec<String> {
                 i += 1;
             }
             State::BlockComment => {
-                current.push(c);
-                if c == '*' && chars.get(i + 1) == Some(&'/') {
-                    current.push('/');
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    comment_depth += 1;
+                    current.push(c);
+                    current.push('*');
                     i += 2;
-                    state = State::Top;
                     continue;
                 }
+                if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    comment_depth -= 1;
+                    current.push('*');
+                    current.push('/');
+                    i += 2;
+                    if comment_depth == 0 {
+                        state = State::Top;
+                    }
+                    continue;
+                }
+                current.push(c);
                 i += 1;
             }
             State::DollarQuote => {
@@ -214,6 +229,21 @@ mod tests {
         assert!(got[0].contains("SELECT 1; SELECT 2;"));
         assert!(got[0].trim_end().ends_with("LANGUAGE plpgsql"));
         assert_eq!(got[1], "SELECT 3");
+    }
+
+    #[test]
+    fn block_comments_nest() {
+        // PostgreSQL block comments nest: `/* outer /* inner */ still
+        // comment */` is ONE comment, not two. A single-level implementation
+        // closes the comment at the first `*/` (right after "inner"),
+        // leaving the semicolon that follows as ordinary top-level text and
+        // splitting what should be one statement into a garbled pair.
+        let sql = "/* outer /* inner */ still comment; with semicolon */ SELECT 1;";
+        let got = split(sql);
+        assert_eq!(
+            got,
+            vec!["/* outer /* inner */ still comment; with semicolon */ SELECT 1"]
+        );
     }
 
     #[test]
