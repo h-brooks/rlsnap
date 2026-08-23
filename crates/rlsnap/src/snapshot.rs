@@ -159,13 +159,18 @@ async fn run_persona(
     })
 }
 
-/// Build a snapshot of `target_name` following `config`. `want_rows` enables
-/// the data layer (row counts, cap warnings, asserts) and requires a
-/// behavioural target.
+/// Build a snapshot of `target_name` following `config`. `with_rows_flag` is
+/// the CLI's `--with-rows` flag: its only remaining effect is to reject a
+/// catalog target outright, since catalog mode can never produce the data
+/// layer. The data layer itself (row counts, cap warnings, asserts) is
+/// unconditional on any behavioural target -- per the snapshot format, it is
+/// "present only in behavioural mode", not "present only when a flag was
+/// passed". Gating it behind the flag made `accept --with-rows` followed by
+/// the documented bare `check` report every finding as spuriously removed.
 pub async fn build_snapshot(
     config: &RlsnapConfig,
     target_name: &str,
-    want_rows: bool,
+    with_rows_flag: bool,
 ) -> Result<Snapshot> {
     let target = config
         .core
@@ -173,9 +178,10 @@ pub async fn build_snapshot(
         .ok_or_else(|| anyhow!("unknown target {target_name:?}"))?
         .clone();
 
-    if want_rows && target.mode == Mode::Catalog {
+    if with_rows_flag && target.mode == Mode::Catalog {
         bail!("--with-rows requires a behavioural target (target {target_name:?} is catalog mode)");
     }
+    let want_rows = target.mode == Mode::Behavioural;
 
     // Discover the schema shape (tables, columns, policies, functions) once,
     // as the connecting role, before probing any persona.

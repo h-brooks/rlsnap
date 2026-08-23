@@ -30,8 +30,9 @@ enum Command {
         target: String,
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Also capture the data layer: row counts, cap warnings, asserts.
-        /// Requires a behavioural target.
+        /// Behavioural targets always capture the data layer (row counts,
+        /// cap warnings, asserts). This flag exists only to reject a
+        /// catalog target explicitly, since catalog mode never has one.
         #[arg(long)]
         with_rows: bool,
     },
@@ -150,7 +151,7 @@ pub async fn run(args: &[String], cwd: &Path) -> Result<i32> {
         } => {
             let sa = read_snapshot(&resolve(cwd, &a))?;
             let sb = read_snapshot(&resolve(cwd, &b))?;
-            let d = diff::diff(&sa, &sb);
+            let d = diff::diff(&sa, &sb)?;
             print!("{}", render_diff(&d, format));
             Ok(d.exit_code(strict_data))
         }
@@ -171,7 +172,7 @@ pub async fn run(args: &[String], cwd: &Path) -> Result<i32> {
             }
             let baseline = read_snapshot(&baseline_path)?;
             let current = snapshot::build_snapshot(&config, &target, with_rows).await?;
-            let d = diff::diff(&baseline, &current);
+            let d = diff::diff(&baseline, &current)?;
             print!("{}", render_diff(&d, format));
             Ok(d.exit_code(strict_data))
         }

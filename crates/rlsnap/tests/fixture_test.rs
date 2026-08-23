@@ -17,9 +17,13 @@ claims = { sub = "staff-1" }
 
 #[tokio::test]
 async fn missing_column_grant_shows_as_denied_privilege() {
+    // `staff` has column-scoped grants on the pre-existing columns only
+    // (the incident this models: a role that relies on per-column grants,
+    // not a blanket table-level grant that would cover a column added
+    // later automatically).
     let h = TestHarness::new(
         "CREATE TABLE widgets (id int primary key, name text not null); \
-         GRANT SELECT, UPDATE ON widgets TO authenticated;",
+         GRANT SELECT (id, name), UPDATE (id, name) ON widgets TO authenticated;",
         &format!("schemas = [\"public\"]\n{STAFF_PERSONA}"),
         "behavioural",
         1000,
@@ -30,7 +34,7 @@ async fn missing_column_grant_shows_as_denied_privilege() {
         .await
         .unwrap();
 
-    // A migration adds a column but forgets its column-scoped UPDATE grant.
+    // A migration adds a column but forgets its column-scoped grants.
     h.db.load_fixture("ALTER TABLE widgets ADD COLUMN owner text;")
         .await;
 
@@ -54,13 +58,73 @@ async fn missing_column_grant_shows_as_denied_privilege() {
         serde_json::from_str(&std::fs::read_to_string(h.path("before.json")).unwrap()).unwrap();
     let after: rlsnap::snapshot::Snapshot =
         serde_json::from_str(&std::fs::read_to_string(h.path("after.json")).unwrap()).unwrap();
-    let d = rlsnap::diff::diff(&before, &after);
+
+    // The new column must be denied for `staff` specifically -- proving the
+    // tool caught the missing column-scoped grant, not merely that some
+    // built-in persona with no grant on the table at all was denied.
+    let owner = &after.privileges["staff"]["public.widgets"].columns["owner"];
+    assert_eq!(owner.select, Some(pgcore::Outcome::DeniedPrivilege));
+    assert_eq!(owner.update, Some(pgcore::Outcome::DeniedPrivilege));
+    // The pre-existing column-scoped grant still works for `staff`, so the
+    // denial above is specific to the new column, not the whole table.
+    let name = &after.privileges["staff"]["public.widgets"].columns["name"];
+    assert_eq!(name.select, Some(pgcore::Outcome::Allowed));
+    assert_eq!(name.update, Some(pgcore::Outcome::Allowed));
+
+    let d = rlsnap::diff::diff(&before, &after).unwrap();
     let table = rlsnap::diff::render_table(&d);
     assert!(
         table.contains("denied_privilege"),
         "expected a denied_privilege cell for the new column, got:\n{table}"
     );
     assert!(table.contains("owner"));
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn check_without_with_rows_flag_still_evaluates_findings_in_behavioural_mode() {
+    let asserts = r#"
+        [[asserts]]
+        name = "always_fails"
+        sql = "SELECT 1"
+        per_persona = false
+    "#;
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id int primary key); GRANT SELECT ON widgets TO authenticated;",
+        &format!("schemas = [\"public\"]\n{STAFF_PERSONA}\n{asserts}"),
+        "behavioural",
+        1000,
+    )
+    .await;
+
+    // Baseline accepted with the data layer explicitly requested.
+    let code = h
+        .run(&["accept", "--target", "test", "--with-rows"])
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    let baseline: rlsnap::snapshot::Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(h.path("rlsnap.snap.json")).unwrap())
+            .unwrap();
+    assert!(
+        baseline
+            .findings
+            .iter()
+            .any(|f| f.name == "assert:always_fails"),
+        "expected the baseline to record the always-failing assert: {:?}",
+        baseline.findings
+    );
+
+    // `check` run bare, exactly as spec item 14 and the brief document it
+    // (no --with-rows), must see the SAME finding on a behavioural target --
+    // not report it as removed just because the flag was omitted this time.
+    let code = h.run(&["check", "--target", "test"]).await.unwrap();
+    assert_eq!(
+        code, 0,
+        "an always-present finding must not appear as a diff just because \
+         --with-rows was omitted from `check`"
+    );
 
     h.close().await;
 }
@@ -138,7 +202,7 @@ async fn policy_text_change_with_unchanged_outcomes_appears_under_policies() {
     // Both policies always evaluate true, so no persona's outcome changes.
     assert_eq!(before.privileges, after.privileges);
 
-    let d = rlsnap::diff::diff(&before, &after);
+    let d = rlsnap::diff::diff(&before, &after).unwrap();
     assert!(d.privilege_changes.is_empty());
     assert_eq!(d.policy_changes.len(), 1);
     assert_eq!(d.policy_changes[0].field, "qual");
@@ -172,7 +236,7 @@ async fn function_newly_executable_by_anon() {
         serde_json::from_str(&std::fs::read_to_string(h.path("before.json")).unwrap()).unwrap();
     let after: rlsnap::snapshot::Snapshot =
         serde_json::from_str(&std::fs::read_to_string(h.path("after.json")).unwrap()).unwrap();
-    let d = rlsnap::diff::diff(&before, &after);
+    let d = rlsnap::diff::diff(&before, &after).unwrap();
 
     assert!(d.function_changes.iter().any(|c| c.persona == "anon"
         && c.before == Some(pgcore::Outcome::DeniedPrivilege)
@@ -348,7 +412,7 @@ async fn tenant_disjointness_assert_fails_after_a_bad_policy_change() {
         after.findings
     );
 
-    let d = rlsnap::diff::diff(&before, &after);
+    let d = rlsnap::diff::diff(&before, &after).unwrap();
     assert!(!d.finding_changes.is_empty());
     assert_eq!(d.exit_code(false), 1);
     let table = rlsnap::diff::render_table(&d);
@@ -408,6 +472,50 @@ async fn catalog_mode_target_rejects_with_rows() {
         ])
         .await;
     assert!(result.is_err(), "catalog targets must reject --with-rows");
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn diff_rejects_a_catalog_snapshot_against_a_behavioural_snapshot_of_the_same_db() {
+    let h = TestHarness::new(
+        "CREATE TABLE widgets (id int primary key); GRANT SELECT ON widgets TO authenticated;",
+        &format!("schemas = [\"public\"]\n{STAFF_PERSONA}"),
+        "behavioural",
+        1000,
+    )
+    .await;
+
+    // A second target, same database, catalog mode -- the exact shape of
+    // `accept --target local` (behavioural) followed by `check --target
+    // prod` (catalog) sharing one snapshot_path.
+    let extra = format!(
+        "\n[targets.cat]\nurl_env = \"{}\"\nmode = \"catalog\"\nmax_rows = 1000\n",
+        h.url_env_name
+    );
+    let mut toml = std::fs::read_to_string(h.path("rlsnap.toml")).unwrap();
+    toml.push_str(&extra);
+    std::fs::write(h.path("rlsnap.toml"), toml).unwrap();
+
+    h.run(&["snapshot", "--target", "test", "--out", "beh.json"])
+        .await
+        .unwrap();
+    h.run(&["snapshot", "--target", "cat", "--out", "cat.json"])
+        .await
+        .unwrap();
+
+    let result = h
+        .run(&[
+            "diff",
+            h.path("beh.json").to_str().unwrap(),
+            h.path("cat.json").to_str().unwrap(),
+        ])
+        .await;
+    assert!(
+        result.is_err(),
+        "diffing a behavioural snapshot against a catalog snapshot of the same schema must be \
+         rejected, not silently produce a wall of privilege changes"
+    );
 
     h.close().await;
 }

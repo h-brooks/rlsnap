@@ -59,8 +59,8 @@ url_env = "RLSNAP_PROD_URL"
 # role = "authenticated"
 # claims = { sub = "00000000-0000-0000-0000-0000000000a1", tenant_id = "tenant-a" }
 
-# Named assertions, evaluated at snapshot time (only with `--with-rows`, on
-# a behavioural target). Each `sql` query must return zero rows to pass; a
+# Named assertions, evaluated at snapshot time on any behavioural target
+# (never in catalog mode). Each `sql` query must return zero rows to pass; a
 # query returning any rows is a finding. `per_persona = true` runs the query
 # inside each persona's own impersonated transaction (for e.g. tenant
 # disjointness or a helper/policy parity check); `per_persona = false` runs
@@ -70,6 +70,19 @@ url_env = "RLSNAP_PROD_URL"
 # name = "tenant_disjointness"
 # sql = "SELECT 1 FROM widgets WHERE tenant_id <> current_setting('request.jwt.claim.tenant_id', true)"
 # per_persona = true
+
+# `insert_probes` (per target, default true): behavioural mode's INSERT and
+# INSERT...RETURNING probes always roll back, but a rolled-back insert still
+# advances any identity/serial sequence it touched -- Postgres does not undo
+# that on ROLLBACK. Table data and privileges are unaffected, only sequence
+# values move. Set `insert_probes = false` on a target if that residue is a
+# problem (e.g. a preview database whose sequence values are asserted on
+# elsewhere).
+#
+# [targets.preview]
+# url_env = "RLSNAP_PREVIEW_URL"
+# mode = "behavioural"
+# insert_probes = false
 "#;
 
 pub fn run_init(dir: &Path) -> Result<()> {
