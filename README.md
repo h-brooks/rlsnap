@@ -4,14 +4,14 @@ Snapshot testing for Postgres access control.
 
 Probes every persona × table × column × operation on a Supabase/Postgres database, writes a deterministic snapshot, and diffs it in CI — so a migration that widens or narrows access shows up as a reviewable diff, not a client bug report.
 
-Status: workspace scaffolding in place; `rlsnap` and `rehearse` are not implemented yet (they exit 2 with "not implemented"). See `docs/rlsnap-spec.md` for the full design. See issue #1.
+Status: `rlsnap` implements `init`, `snapshot`, `diff`, `check`, `accept`, and `explain` against real Postgres, in both catalog and behavioural mode. `rehearse` is not implemented yet (it exits 2 with "not implemented"). See `docs/rlsnap-spec.md` for the full design. See issue #1.
 
 ## Workspace layout
 
 This is a cargo workspace with three crates:
 
 - **`crates/pgcore`** — the shared library. Config loading (`rlsnap.toml` / `pgkit.toml`), the always-rolls-back probe transaction (`RollbackTx`), persona impersonation, SQLSTATE outcome classification, catalog snapshotting + diffing, and a quote-and-comment-aware SQL statement splitter. This crate is frozen: `rlsnap` and `rehearse` build on it without editing it.
-- **`crates/rlsnap`** — the snapshot/diff CLI described in the spec. Currently a stub.
+- **`crates/rlsnap`** — the snapshot/diff CLI described in the spec.
 - **`crates/rehearse`** — a sibling tool for migration rehearsal, sharing the same core. Currently a stub.
 
 ## Running tests
