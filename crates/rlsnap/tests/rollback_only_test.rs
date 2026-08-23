@@ -67,14 +67,15 @@ fn commit_never_appears_outside_a_comment() {
     }
     assert!(!files.is_empty(), "expected to find .rs files under src/");
 
-    // One deliberate exception: `crates/rehearse/src/migrate.rs` contains the
-    // guard that REFUSES transaction-control statements found inside a
-    // migration file. Detecting and naming `COMMIT` in code and error
-    // messages is that module's entire job; it never sends the statement.
-    // Its behaviour is pinned by rehearse's own tests
-    // (`transaction_control_violation`, and the integration test proving a
-    // migration containing COMMIT is refused with the database unchanged).
-    let allowlisted = |file: &Path| file.ends_with("rehearse/src/migrate.rs");
+    // One deliberate exception: `crates/pgcore/src/txguard.rs` contains the
+    // shared guard that REFUSES transaction-control statements found in a
+    // migration file (rehearse) or a persona's `setup_sql` (rlsnap).
+    // Detecting and naming `COMMIT` in code and error messages is that
+    // module's entire job; it never sends the statement. Its behaviour is
+    // pinned by its own unit tests (`transaction_control_violation`) and by
+    // each crate's integration tests proving a COMMIT is refused with the
+    // database unchanged.
+    let allowlisted = |file: &Path| file.ends_with("pgcore/src/txguard.rs");
 
     for file in files {
         let text = std::fs::read_to_string(&file).unwrap();

@@ -1,10 +1,10 @@
 //! `rlsnap explain <persona> <table> <op>`: print the ACL entries and
 //! policies from the catalog relevant to one cell.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use pgcore::catalog;
-use pgcore::RollbackTx;
+use pgcore::{Mode, RollbackTx};
 
 use crate::config::RlsnapConfig;
 use crate::probe;
@@ -64,6 +64,18 @@ pub async fn run_explain(
         .ok_or_else(|| anyhow!("unknown persona {persona_name:?}"))?;
     let privilege = op_to_privilege(op)?;
 
+    // Same rule as `build_snapshot`: catalog mode never executes
+    // user-supplied SQL, so a persona with `setup_sql` configured for a
+    // catalog target is a configuration error, not something to skip
+    // silently.
+    if target.mode == Mode::Catalog && persona.setup_sql.is_some() {
+        bail!(
+            "persona {persona_name:?} has setup_sql configured, but target {target_name:?} is \
+             catalog mode: catalog mode never executes user-supplied SQL; remove setup_sql from \
+             persona {persona_name:?}, or run this target in behavioural mode"
+        );
+    }
+
     let client = target.connect().await.context("connect")?;
     let tx = RollbackTx::begin(client, target.statement_timeout_ms, target.lock_timeout_ms)
         .await
@@ -87,11 +99,18 @@ pub async fn run_explain(
 
     // The same table-level check the snapshot itself would record for this
     // cell, so the grant/policy listing below can be cross-checked against
-    // the actual outcome instead of trusted on faith.
-    persona
-        .apply(&tx)
-        .await
-        .with_context(|| format!("apply persona {persona_name:?}"))?;
+    // the actual outcome instead of trusted on faith. Catalog mode skips
+    // setup_sql entirely (see the check above), matching `build_snapshot`.
+    match target.mode {
+        Mode::Catalog => persona
+            .apply_role_and_claims(&tx)
+            .await
+            .with_context(|| format!("apply persona {persona_name:?}"))?,
+        Mode::Behavioural => persona
+            .apply(&tx)
+            .await
+            .with_context(|| format!("apply persona {persona_name:?}"))?,
+    }
     let outcome = probe::has_table_priv(&tx, table, privilege)
         .await
         .context("probe table privilege")?;

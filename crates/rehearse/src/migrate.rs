@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use pgcore::txguard::{skip_leading_trivia, transaction_control_violation};
 use pgcore::{catalog, sqlsplit, Mode, RollbackTx};
 
 use crate::config::LoadedConfig;
@@ -159,61 +160,6 @@ pub async fn run(args: RunArgs) -> anyhow::Result<(Report, i32)> {
     Ok((report, if ok { 0 } else { 1 }))
 }
 
-/// Detects a statement that would itself end (or is a synonym for ending)
-/// the rehearsal transaction — `COMMIT`, `END`, or a bare `ROLLBACK` (but
-/// not `ROLLBACK TO SAVEPOINT`, which is safe: it stays inside the
-/// transaction). Running any of these would defeat the tool's one
-/// invariant: the migration only ever runs inside a single transaction that
-/// rehearse itself ends with `ROLLBACK`. Returns a human-readable refusal
-/// message when `stmt` matches; the statement is never sent to Postgres
-/// when this returns `Some`.
-///
-/// Safety-rule note (see `lib.rs`): every occurrence of the words `COMMIT`,
-/// `END`, and `ROLLBACK` below — in this function, its error messages, and
-/// its unit tests — names a keyword this function detects and *refuses*,
-/// never one it sends. This is the enforcement mechanism for the
-/// always-`ROLLBACK` invariant, not an exception to it.
-fn transaction_control_violation(stmt: &str) -> Option<String> {
-    let effective = skip_leading_trivia(stmt);
-    let upper = effective.to_ascii_uppercase();
-
-    let word_boundary_follows = |rest: &str| -> bool {
-        !rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-    };
-
-    if let Some(rest) = upper.strip_prefix("COMMIT") {
-        if word_boundary_follows(rest) {
-            return Some(
-                "refusing to run COMMIT: it would end the rehearsal transaction early, \
-                 permanently applying every statement run so far"
-                    .to_string(),
-            );
-        }
-    }
-    if let Some(rest) = upper.strip_prefix("END") {
-        if word_boundary_follows(rest) {
-            return Some(
-                "refusing to run END: it is a synonym for COMMIT and would end the rehearsal \
-                 transaction early, permanently applying every statement run so far"
-                    .to_string(),
-            );
-        }
-    }
-    if let Some(rest) = upper.strip_prefix("ROLLBACK") {
-        if word_boundary_follows(rest) && !rest.trim_start().starts_with("TO") {
-            return Some(
-                "refusing to run ROLLBACK: it would end the rehearsal transaction early, \
-                 leaving later statements to run outside of it"
-                    .to_string(),
-            );
-        }
-    }
-    None
-}
-
 /// Detects a statement that Postgres refuses to run at all inside a
 /// transaction block (SQLSTATE 25001, "cannot run inside a transaction
 /// block"): `CREATE`/`DROP INDEX CONCURRENTLY`, `REINDEX ... CONCURRENTLY`,
@@ -272,62 +218,9 @@ fn head_words(s: &str, max: usize) -> Vec<String> {
         .collect()
 }
 
-/// Skip leading whitespace and comments, so a comment placed before
-/// `COMMIT`/`END`/`ROLLBACK` cannot hide it from `transaction_control_violation`.
-fn skip_leading_trivia(s: &str) -> &str {
-    let mut s = s;
-    loop {
-        let trimmed = s.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("--") {
-            s = rest.split_once('\n').map_or("", |(_, after)| after);
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/*") {
-            s = rest.split_once("*/").map_or("", |(_, after)| after);
-            continue;
-        }
-        return trimmed;
-    }
-}
-
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-
-    #[test]
-    fn blocks_commit_in_any_form() {
-        assert!(transaction_control_violation("COMMIT").is_some());
-        assert!(transaction_control_violation("commit;").is_some());
-        assert!(transaction_control_violation("COMMIT WORK").is_some());
-        assert!(transaction_control_violation("COMMIT AND CHAIN").is_some());
-    }
-
-    #[test]
-    fn blocks_end_and_bare_rollback() {
-        assert!(transaction_control_violation("END").is_some());
-        assert!(transaction_control_violation("ROLLBACK").is_some());
-        assert!(transaction_control_violation("ROLLBACK WORK").is_some());
-        assert!(transaction_control_violation("ROLLBACK TRANSACTION").is_some());
-    }
-
-    #[test]
-    fn allows_rollback_to_savepoint() {
-        assert!(transaction_control_violation("ROLLBACK TO SAVEPOINT foo").is_none());
-        assert!(transaction_control_violation("rollback to savepoint foo").is_none());
-    }
-
-    #[test]
-    fn allows_ordinary_statements() {
-        assert!(transaction_control_violation("SELECT 1").is_none());
-        assert!(transaction_control_violation("UPDATE widgets SET qty = 1").is_none());
-        assert!(transaction_control_violation("CREATE TABLE commit_log (id int)").is_none());
-    }
-
-    #[test]
-    fn sees_through_leading_comments() {
-        assert!(transaction_control_violation("-- sneaky\nCOMMIT").is_some());
-        assert!(transaction_control_violation("/* sneaky */ COMMIT").is_some());
-    }
 
     #[test]
     fn blocks_create_index_concurrently() {

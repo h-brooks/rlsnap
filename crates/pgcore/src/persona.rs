@@ -2,8 +2,21 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 
+use crate::sqlsplit;
 use crate::tx::{quote_ident, RollbackTx};
+use crate::txguard::transaction_control_violation;
+
+/// Failure applying a persona: either its `setup_sql` was refused by the
+/// transaction-control guard, or a plain Postgres error.
+#[derive(Debug, Error)]
+pub enum ApplyError {
+    #[error("persona {persona:?} setup_sql refused: {reason}")]
+    SetupSqlRefused { persona: String, reason: String },
+    #[error(transparent)]
+    Postgres(#[from] tokio_postgres::Error),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Persona {
@@ -57,11 +70,45 @@ impl Persona {
     /// Apply this persona inside `tx`: run `setup_sql` (as the connecting
     /// role), then `SET LOCAL ROLE`, then set `request.jwt.claims` and one
     /// `request.jwt.claim.<key>` per top-level claim key.
-    pub async fn apply(&self, tx: &RollbackTx) -> Result<(), tokio_postgres::Error> {
+    ///
+    /// Every statement of `setup_sql` is checked against the
+    /// transaction-control guard ([`transaction_control_violation`]) before
+    /// any of it runs: `setup_sql` is user-supplied, and a `COMMIT` buried
+    /// inside it would otherwise escape the caller's rollback-only
+    /// transaction entirely, permanently applying every statement run so
+    /// far. Nothing in `setup_sql` is sent to Postgres if any statement is
+    /// refused.
+    pub async fn apply(&self, tx: &RollbackTx) -> Result<(), ApplyError> {
         if let Some(sql) = &self.setup_sql {
+            for stmt in sqlsplit::split(sql) {
+                if let Some(reason) = transaction_control_violation(&stmt) {
+                    return Err(ApplyError::SetupSqlRefused {
+                        persona: self.name.clone(),
+                        reason,
+                    });
+                }
+            }
             tx.batch_execute(sql).await?;
         }
 
+        self.apply_role_and_claims(tx).await?;
+        Ok(())
+    }
+
+    /// Apply only the role/claims half of persona impersonation: `SET LOCAL
+    /// ROLE`, then `request.jwt.claims` and one `request.jwt.claim.<key>`
+    /// per top-level claim key. Skips `setup_sql` entirely.
+    ///
+    /// Used for catalog-mode probing, which never executes user-supplied
+    /// SQL (catalog mode's whole promise is zero DML). Callers using this
+    /// method are responsible for having already rejected any persona
+    /// configured with `setup_sql` for a catalog target: silently skipping
+    /// it here, with no caller-side check, would change results without
+    /// saying so.
+    pub async fn apply_role_and_claims(
+        &self,
+        tx: &RollbackTx,
+    ) -> Result<(), tokio_postgres::Error> {
         let ident = quote_ident(&self.role);
         tx.batch_execute(&format!("SET LOCAL ROLE {ident}")).await?;
 

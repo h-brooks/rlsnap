@@ -10,9 +10,10 @@ pub mod outcome;
 pub mod persona;
 pub mod sqlsplit;
 pub mod tx;
+pub mod txguard;
 
 pub use catalog::{Catalog, CatalogDiff};
 pub use config::{Config, Mode, Target};
 pub use outcome::{classify, Outcome};
-pub use persona::Persona;
+pub use persona::{ApplyError, Persona};
 pub use tx::{RollbackTx, Savepoint};

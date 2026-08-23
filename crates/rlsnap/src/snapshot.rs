@@ -120,10 +120,20 @@ async fn run_persona(
     let tx = RollbackTx::begin(client, target.statement_timeout_ms, target.lock_timeout_ms)
         .await
         .context("begin persona probe transaction")?;
-    persona
-        .apply(&tx)
-        .await
-        .with_context(|| format!("apply persona {:?}", persona.name))?;
+    // Catalog mode never executes user-supplied SQL (its whole promise is
+    // zero DML), so `setup_sql` is skipped entirely rather than run: the
+    // config-validation pass in `build_snapshot` guarantees no persona
+    // configured for a catalog target has `setup_sql` in the first place.
+    match mode {
+        Mode::Catalog => persona
+            .apply_role_and_claims(&tx)
+            .await
+            .with_context(|| format!("apply persona {:?}", persona.name))?,
+        Mode::Behavioural => persona
+            .apply(&tx)
+            .await
+            .with_context(|| format!("apply persona {:?}", persona.name))?,
+    }
 
     let mut table_results = BTreeMap::new();
     let mut row_counts = BTreeMap::new();
@@ -207,6 +217,24 @@ pub async fn build_snapshot(
 
     if with_rows_flag && target.mode == Mode::Catalog {
         bail!("--with-rows requires a behavioural target (target {target_name:?} is catalog mode)");
+    }
+
+    // Catalog mode never executes user-supplied SQL: it is read-only by
+    // design (privilege functions and catalog reads only, no DML). A
+    // persona's `setup_sql` is DML by definition, so a persona configured
+    // with `setup_sql` for a catalog target is a configuration error, not
+    // something to silently skip: skipping it would change that persona's
+    // results (its setup never having run) without saying so anywhere.
+    if target.mode == Mode::Catalog {
+        if let Some(p) = config.personas.iter().find(|p| p.setup_sql.is_some()) {
+            bail!(
+                "persona {:?} has setup_sql configured, but target {target_name:?} is catalog \
+                 mode: catalog mode never executes user-supplied SQL; remove setup_sql from \
+                 persona {:?}, or run this target in behavioural mode",
+                p.name,
+                p.name
+            );
+        }
     }
     let want_rows = target.mode == Mode::Behavioural;
 
