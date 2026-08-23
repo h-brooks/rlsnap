@@ -1,0 +1,132 @@
+//! `rlsnap explain <persona> <table> <op>`: print the ACL entries and
+//! policies from the catalog relevant to one cell.
+
+use anyhow::{anyhow, Context, Result};
+
+use pgcore::catalog;
+use pgcore::RollbackTx;
+
+use crate::config::RlsnapConfig;
+
+/// Map an op name (as used in the privileges section) to the Postgres
+/// privilege/command it corresponds to.
+fn op_to_privilege(op: &str) -> Result<&'static str> {
+    match op {
+        "select_count" | "select" => Ok("SELECT"),
+        "insert" | "insert_returning" => Ok("INSERT"),
+        "update" => Ok("UPDATE"),
+        "delete" => Ok("DELETE"),
+        other => Err(anyhow!(
+            "unknown op {other:?} (expected one of: select_count, select, insert, insert_returning, update, delete)"
+        )),
+    }
+}
+
+pub async fn run_explain(
+    config: &RlsnapConfig,
+    target_name: &str,
+    persona_name: &str,
+    table: &str,
+    op: &str,
+) -> Result<String> {
+    let target = config
+        .core
+        .target(target_name)
+        .ok_or_else(|| anyhow!("unknown target {target_name:?}"))?;
+    let persona = config
+        .personas
+        .iter()
+        .find(|p| p.name == persona_name)
+        .ok_or_else(|| anyhow!("unknown persona {persona_name:?}"))?;
+    let privilege = op_to_privilege(op)?;
+
+    let client = target.connect().await.context("connect")?;
+    let tx = RollbackTx::begin(client, target.statement_timeout_ms, target.lock_timeout_ms)
+        .await
+        .context("begin transaction")?;
+    let catalog = catalog::snapshot(&tx, &config.schemas)
+        .await
+        .context("snapshot catalog")?;
+    tx.finish().await.context("finish transaction")?;
+
+    let info = catalog.tables.get(table).ok_or_else(|| {
+        anyhow!(
+            "unknown table {table:?} (checked schemas: {:?})",
+            config.schemas
+        )
+    })?;
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "persona {persona_name:?} (role {:?}), table {table:?}, op {op:?} ({privilege})\n\n",
+        persona.role
+    ));
+
+    out.push_str("table-level grants:\n");
+    let mut any_table_grant = false;
+    if let Some(privs) = info.table_grants.grants.get(&persona.role) {
+        if privs.contains(privilege) {
+            out.push_str(&format!("  GRANT {privilege} ... TO {}\n", persona.role));
+            any_table_grant = true;
+        }
+    }
+    if let Some(privs) = info.table_grants.grants.get("public") {
+        if privs.contains(privilege) {
+            out.push_str(&format!("  GRANT {privilege} ... TO public\n"));
+            any_table_grant = true;
+        }
+    }
+    if !any_table_grant {
+        out.push_str("  (none)\n");
+    }
+
+    out.push_str("\ncolumn-level grants:\n");
+    let mut any_col_grant = false;
+    for (column, grants) in &info.column_grants {
+        for grantee in [persona.role.as_str(), "public"] {
+            if grants
+                .grants
+                .get(grantee)
+                .is_some_and(|p| p.contains(privilege))
+            {
+                out.push_str(&format!(
+                    "  GRANT {privilege} ({column}) ... TO {grantee}\n"
+                ));
+                any_col_grant = true;
+            }
+        }
+    }
+    if !any_col_grant {
+        out.push_str("  (none)\n");
+    }
+
+    out.push_str(&format!(
+        "\nrow-level security: enabled={} forced={}\n",
+        info.rls_enabled, info.rls_forced
+    ));
+    out.push_str("matching policies:\n");
+    let mut any_policy = false;
+    for (name, policy) in &info.policies {
+        let cmd_matches = policy.cmd == "ALL" || policy.cmd == privilege;
+        let role_matches = policy
+            .roles
+            .iter()
+            .any(|r| r == &persona.role || r == "public");
+        if cmd_matches && role_matches {
+            out.push_str(&format!(
+                "  {name}: cmd={} permissive={} roles={:?}\n    USING: {}\n    WITH CHECK: {}\n",
+                policy.cmd,
+                policy.permissive,
+                policy.roles,
+                policy.qual.clone().unwrap_or_else(|| "-".to_string()),
+                policy.with_check.clone().unwrap_or_else(|| "-".to_string()),
+            ));
+            any_policy = true;
+        }
+    }
+    if !any_policy {
+        out.push_str("  (none)\n");
+    }
+
+    Ok(out)
+}
