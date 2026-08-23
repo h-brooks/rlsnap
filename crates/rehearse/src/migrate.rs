@@ -56,10 +56,14 @@ pub async fn run(args: RunArgs) -> anyhow::Result<(Report, i32)> {
 
     let start_all = Instant::now();
     for (index, stmt) in statements.iter().enumerate() {
-        if let Some(reason) = transaction_control_violation(stmt) {
-            // Never send this statement to Postgres at all: doing so would
-            // end the rehearsal transaction, defeating the tool's one
-            // invariant (see the module doc on `lib.rs`).
+        if let Some(reason) =
+            transaction_control_violation(stmt).or_else(|| transaction_incompatible_violation(stmt))
+        {
+            // Never send this statement to Postgres at all: either it would
+            // end the rehearsal transaction (defeating the tool's one
+            // invariant, see the module doc on `lib.rs`), or Postgres would
+            // refuse it outright with a confusing 25001 because it cannot
+            // run inside a transaction block at all.
             per_statement_ms.push(0);
             records.push(StatementRecord {
                 index,
@@ -210,6 +214,64 @@ fn transaction_control_violation(stmt: &str) -> Option<String> {
     None
 }
 
+/// Detects a statement that Postgres refuses to run at all inside a
+/// transaction block (SQLSTATE 25001, "cannot run inside a transaction
+/// block"): `CREATE`/`DROP INDEX CONCURRENTLY`, `REINDEX ... CONCURRENTLY`,
+/// `VACUUM`, `CREATE`/`DROP DATABASE`, `ALTER SYSTEM`, and
+/// `CREATE`/`DROP TABLESPACE`. Left undetected, one of these fails mid-run
+/// with a confusing 25001 instead of a clear refusal; caught here, before it
+/// is ever sent, the rest of the migration is not attempted either, so the
+/// whole rehearsal is refused up front and rolled back like any other
+/// invariant violation. Matching looks only at the statement's head (a
+/// bounded run of leading keywords), never the rest of the statement, so a
+/// string literal or later clause containing one of these words cannot
+/// trigger a false positive.
+fn transaction_incompatible_violation(stmt: &str) -> Option<String> {
+    let effective = skip_leading_trivia(stmt);
+    let words = head_words(effective, 8);
+    let heads: Vec<&str> = words.iter().map(String::as_str).collect();
+
+    let name = match heads.as_slice() {
+        ["CREATE", "UNIQUE", "INDEX", "CONCURRENTLY", ..] => {
+            Some("CREATE UNIQUE INDEX CONCURRENTLY")
+        }
+        ["CREATE", "INDEX", "CONCURRENTLY", ..] => Some("CREATE INDEX CONCURRENTLY"),
+        ["DROP", "INDEX", "CONCURRENTLY", ..] => Some("DROP INDEX CONCURRENTLY"),
+        ["VACUUM", ..] => Some("VACUUM"),
+        ["CREATE", "DATABASE", ..] => Some("CREATE DATABASE"),
+        ["DROP", "DATABASE", ..] => Some("DROP DATABASE"),
+        ["ALTER", "SYSTEM", ..] => Some("ALTER SYSTEM"),
+        ["CREATE", "TABLESPACE", ..] => Some("CREATE TABLESPACE"),
+        ["DROP", "TABLESPACE", ..] => Some("DROP TABLESPACE"),
+        ["REINDEX", rest @ ..] if rest.contains(&"CONCURRENTLY") => {
+            Some("REINDEX ... CONCURRENTLY")
+        }
+        _ => None,
+    }?;
+
+    Some(format!(
+        "refusing to run {name}: it cannot run inside a rehearsal transaction (Postgres does \
+         not allow this statement inside a transaction block); run it directly against a \
+         disposable branch or clone instead"
+    ))
+}
+
+/// The first `max` alphanumeric/underscore "words" of `s`, upper-cased,
+/// treating everything else (parentheses, commas, dots, whitespace) as a
+/// separator. This tokenizes options like `VACUUM (FULL)` and
+/// `REINDEX (CONCURRENTLY) INDEX foo`, and stays tolerant of `IF NOT
+/// EXISTS`/`IF EXISTS` and schema-qualified names, while only ever looking
+/// at a short, bounded prefix of the statement rather than searching its
+/// full text (which is what keeps this from matching a keyword that
+/// happens to appear inside a string literal or a later clause).
+fn head_words(s: &str, max: usize) -> Vec<String> {
+    s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .take(max)
+        .map(str::to_ascii_uppercase)
+        .collect()
+}
+
 /// Skip leading whitespace and comments, so a comment placed before
 /// `COMMIT`/`END`/`ROLLBACK` cannot hide it from `transaction_control_violation`.
 fn skip_leading_trivia(s: &str) -> &str {
@@ -265,5 +327,115 @@ mod unit_tests {
     fn sees_through_leading_comments() {
         assert!(transaction_control_violation("-- sneaky\nCOMMIT").is_some());
         assert!(transaction_control_violation("/* sneaky */ COMMIT").is_some());
+    }
+
+    #[test]
+    fn blocks_create_index_concurrently() {
+        assert!(
+            transaction_incompatible_violation("CREATE INDEX CONCURRENTLY idx ON t (c)").is_some()
+        );
+        assert!(transaction_incompatible_violation(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON t (c)"
+        )
+        .is_some());
+        assert!(
+            transaction_incompatible_violation("create index concurrently idx on t (c)").is_some()
+        );
+        assert!(transaction_incompatible_violation(
+            "CREATE UNIQUE INDEX CONCURRENTLY idx ON t (c)"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn allows_create_index_without_concurrently() {
+        assert!(transaction_incompatible_violation("CREATE INDEX idx ON t (c)").is_none());
+        assert!(transaction_incompatible_violation("CREATE UNIQUE INDEX idx ON t (c)").is_none());
+        assert!(
+            transaction_incompatible_violation("CREATE INDEX IF NOT EXISTS idx ON t (c)").is_none()
+        );
+    }
+
+    #[test]
+    fn blocks_drop_index_concurrently() {
+        assert!(transaction_incompatible_violation("DROP INDEX CONCURRENTLY idx").is_some());
+        assert!(
+            transaction_incompatible_violation("DROP INDEX CONCURRENTLY IF EXISTS s.idx").is_some()
+        );
+    }
+
+    #[test]
+    fn blocks_reindex_concurrently_in_any_target_form() {
+        assert!(transaction_incompatible_violation("REINDEX INDEX CONCURRENTLY idx").is_some());
+        assert!(transaction_incompatible_violation("REINDEX TABLE CONCURRENTLY t").is_some());
+        assert!(transaction_incompatible_violation("REINDEX SCHEMA CONCURRENTLY s").is_some());
+        assert!(transaction_incompatible_violation("REINDEX (CONCURRENTLY) INDEX idx").is_some());
+    }
+
+    #[test]
+    fn allows_reindex_without_concurrently() {
+        assert!(transaction_incompatible_violation("REINDEX INDEX idx").is_none());
+        assert!(transaction_incompatible_violation("REINDEX TABLE t").is_none());
+    }
+
+    #[test]
+    fn blocks_vacuum_in_any_form() {
+        assert!(transaction_incompatible_violation("VACUUM").is_some());
+        assert!(transaction_incompatible_violation("VACUUM widgets").is_some());
+        assert!(transaction_incompatible_violation("VACUUM (FULL) widgets").is_some());
+        assert!(transaction_incompatible_violation("vacuum analyze widgets").is_some());
+    }
+
+    #[test]
+    fn does_not_false_positive_on_vacuum_inside_a_string_literal() {
+        assert!(transaction_incompatible_violation(
+            "INSERT INTO logs (message) VALUES ('please VACUUM this table later')"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn blocks_create_and_drop_database() {
+        assert!(transaction_incompatible_violation("CREATE DATABASE foo").is_some());
+        assert!(transaction_incompatible_violation("DROP DATABASE foo").is_some());
+        assert!(transaction_incompatible_violation("DROP DATABASE IF EXISTS foo").is_some());
+    }
+
+    #[test]
+    fn blocks_alter_system() {
+        assert!(transaction_incompatible_violation("ALTER SYSTEM SET work_mem = '64MB'").is_some());
+        assert!(transaction_incompatible_violation("ALTER SYSTEM RESET work_mem").is_some());
+    }
+
+    #[test]
+    fn blocks_create_and_drop_tablespace() {
+        assert!(
+            transaction_incompatible_violation("CREATE TABLESPACE fast LOCATION '/data'").is_some()
+        );
+        assert!(transaction_incompatible_violation("DROP TABLESPACE fast").is_some());
+    }
+
+    #[test]
+    fn allows_ordinary_statements_incompatible_check() {
+        assert!(transaction_incompatible_violation("SELECT 1").is_none());
+        assert!(transaction_incompatible_violation("CREATE TABLE widgets (id int)").is_none());
+        assert!(
+            transaction_incompatible_violation("ALTER TABLE widgets ADD COLUMN name text")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sees_through_leading_comments_for_transaction_incompatible_statements() {
+        assert!(transaction_incompatible_violation("-- sneaky\nVACUUM").is_some());
+        assert!(transaction_incompatible_violation("/* sneaky */ VACUUM").is_some());
+    }
+
+    #[test]
+    fn transaction_incompatible_message_names_the_statement_and_a_disposable_alternative() {
+        let msg = transaction_incompatible_violation("VACUUM").unwrap();
+        assert!(msg.contains("VACUUM"));
+        assert!(msg.contains("cannot run inside a rehearsal transaction"));
+        assert!(msg.to_ascii_lowercase().contains("disposable"));
     }
 }

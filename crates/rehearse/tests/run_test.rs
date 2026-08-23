@@ -530,6 +530,164 @@ async fn commit_in_migration_is_refused_and_nothing_reaches_postgres() {
 }
 
 #[tokio::test]
+async fn create_index_concurrently_is_refused_and_prior_statement_still_rolls_back() {
+    let db = TestDb::create().await;
+    db.load_fixture("CREATE TABLE widgets (id int, name text);")
+        .await;
+
+    let scratch = Scratch::new();
+    let url_env = unique_env_var_name();
+    let config = write_config(&scratch, "t", &url_env, None);
+    let migration = scratch.write(
+        "migration.sql",
+        "ALTER TABLE widgets ADD COLUMN sneaky text;\n\
+         CREATE INDEX CONCURRENTLY widgets_name_idx ON widgets (name);\n",
+    );
+
+    let result = run_bin(
+        &[
+            "run",
+            migration.to_str().unwrap(),
+            "--target",
+            "t",
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+        &[(&url_env, &db.url())],
+    );
+
+    assert_eq!(result.status, 1, "stderr: {}", result.stderr);
+    let json: serde_json::Value = serde_json::from_str(&result.stdout).expect("valid json");
+    assert_eq!(json["summary"]["ok"], false);
+    assert_eq!(json["failure"]["statement_index"], 1);
+    let message = json["failure"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("cannot run inside a rehearsal transaction"),
+        "failure message should explain why: {message}"
+    );
+    assert!(
+        json["failure"]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("CONCURRENTLY"),
+        "report should name the refused statement: {json}"
+    );
+
+    let statements = json["statements"].as_array().expect("statements array");
+    assert_eq!(
+        statements.len(),
+        2,
+        "CREATE INDEX CONCURRENTLY must never be sent: {statements:?}"
+    );
+    assert_eq!(statements[0]["status"], "ok");
+    assert_eq!(statements[1]["status"], "error");
+
+    // Out-of-band, independent of rehearse's own report: neither the
+    // earlier ALTER TABLE nor the index ever reached the real database.
+    let client = db.connect().await;
+    let sneaky_cols: i64 = client
+        .query_one(
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_name = 'widgets' AND column_name = 'sneaky'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        sneaky_cols, 0,
+        "the ALTER TABLE before the refused statement must have rolled back"
+    );
+    let idx_count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_indexes WHERE indexname = 'widgets_name_idx'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        idx_count, 0,
+        "CREATE INDEX CONCURRENTLY must never have reached Postgres"
+    );
+
+    db.close().await;
+}
+
+#[tokio::test]
+async fn plain_create_index_is_still_allowed() {
+    let db = TestDb::create().await;
+    db.load_fixture("CREATE TABLE widgets (id int, name text);")
+        .await;
+
+    let scratch = Scratch::new();
+    let url_env = unique_env_var_name();
+    let config = write_config(&scratch, "t", &url_env, None);
+    let migration = scratch.write(
+        "migration.sql",
+        "CREATE INDEX widgets_name_idx ON widgets (name);\n",
+    );
+
+    let result = run_bin(
+        &[
+            "run",
+            migration.to_str().unwrap(),
+            "--target",
+            "t",
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+        &[(&url_env, &db.url())],
+    );
+
+    assert_eq!(result.status, 0, "stderr: {}", result.stderr);
+    let json: serde_json::Value = serde_json::from_str(&result.stdout).expect("valid json");
+    assert_eq!(json["summary"]["ok"], true);
+
+    db.close().await;
+}
+
+#[tokio::test]
+async fn vacuum_in_a_migration_is_refused_before_running() {
+    let db = TestDb::create().await;
+    db.load_fixture("CREATE TABLE widgets (id int);").await;
+
+    let scratch = Scratch::new();
+    let url_env = unique_env_var_name();
+    let config = write_config(&scratch, "t", &url_env, None);
+    let migration = scratch.write("migration.sql", "VACUUM widgets;\n");
+
+    let result = run_bin(
+        &[
+            "run",
+            migration.to_str().unwrap(),
+            "--target",
+            "t",
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+        &[(&url_env, &db.url())],
+    );
+
+    assert_eq!(result.status, 1, "stderr: {}", result.stderr);
+    let json: serde_json::Value = serde_json::from_str(&result.stdout).expect("valid json");
+    assert_eq!(json["summary"]["ok"], false);
+    assert_eq!(json["failure"]["statement_index"], 0);
+    assert!(json["failure"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot run inside a rehearsal transaction"));
+
+    db.close().await;
+}
+
+#[tokio::test]
 async fn cross_schema_lock_is_reported_without_a_matching_schema_flag() {
     let db = TestDb::create().await;
     db.load_fixture("CREATE SCHEMA app; CREATE TABLE app.orders (id int);")
