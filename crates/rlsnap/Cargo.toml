@@ -1,0 +1,15 @@
+[package]
+name = "rlsnap"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+
+[[bin]]
+name = "rlsnap"
+path = "src/main.rs"
+
+[dependencies]
+pgcore = { path = "../pgcore" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
