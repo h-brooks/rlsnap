@@ -641,7 +641,11 @@ dependencies = [
  "anyhow",
  "clap",
  "pgcore",
+ "serde",
+ "serde_json",
  "tokio",
+ "tokio-postgres",
+ "toml",
 ]
 
 [[package]]
