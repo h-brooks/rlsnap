@@ -4,6 +4,7 @@
 use pgcore::{catalog, Catalog, CatalogDiff, RollbackTx};
 
 use crate::config::LoadedConfig;
+use crate::probe::require_known_schemas;
 
 pub struct DriftArgs {
     pub a: String,
@@ -43,6 +44,7 @@ async fn load_catalog(
             let (statement_timeout_ms, lock_timeout_ms) = loaded.effective_timeouts(target);
             let client = target.connect().await?;
             let tx = RollbackTx::begin(client, statement_timeout_ms, lock_timeout_ms).await?;
+            require_known_schemas(&tx, schemas).await?;
             let snap = catalog::snapshot(&tx, schemas).await?;
             tx.finish().await?;
             Ok(snap)

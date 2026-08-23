@@ -103,6 +103,125 @@ async fn drift_of_identical_databases_is_empty_and_exits_zero() {
 }
 
 #[tokio::test]
+async fn unknown_schema_flag_is_a_tool_error_not_a_silent_no_differences() {
+    let db_a = TestDb::create().await;
+    let db_b = TestDb::create().await;
+    db_a.load_fixture("CREATE TABLE widgets (id int PRIMARY KEY, qty int);")
+        .await;
+    db_b.load_fixture("CREATE TABLE widgets (id int PRIMARY KEY); CREATE TABLE only_in_b (x int);")
+        .await;
+
+    let scratch = Scratch::new();
+    let url_env_a = unique_env_var_name();
+    let url_env_b = unique_env_var_name();
+    let config = scratch.write(
+        "rlsnap.toml",
+        &format!(
+            "[targets.a]\nurl_env = \"{url_env_a}\"\nmode = \"catalog\"\n\n\
+             [targets.b]\nurl_env = \"{url_env_b}\"\nmode = \"catalog\"\n"
+        ),
+    );
+
+    // Sanity check: without the typo, these two databases really do differ.
+    let sane = run_bin(
+        &[
+            "drift",
+            "target:a",
+            "target:b",
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+        &[(&url_env_a, &db_a.url()), (&url_env_b, &db_b.url())],
+    );
+    assert_eq!(sane.status, 1, "stderr: {}", sane.stderr);
+
+    let result = run_bin(
+        &[
+            "drift",
+            "target:a",
+            "target:b",
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+            "--schema",
+            "pubic",
+        ],
+        &[(&url_env_a, &db_a.url()), (&url_env_b, &db_b.url())],
+    );
+
+    assert_eq!(
+        result.status, 2,
+        "a typo'd --schema must be a tool error, not a false-clean 'no differences'; \
+         stdout: {} stderr: {}",
+        result.stdout, result.stderr
+    );
+    assert!(result.stdout.is_empty());
+    assert!(result.stderr.contains("pubic"));
+
+    db_a.close().await;
+    db_b.close().await;
+}
+
+#[tokio::test]
+async fn table_format_renders_diff_and_no_differences() {
+    let db_a = TestDb::create().await;
+    let db_b = TestDb::create().await;
+    let fixture = "CREATE TABLE widgets (id int PRIMARY KEY);";
+    db_a.load_fixture(fixture).await;
+    db_b.load_fixture(fixture).await;
+
+    let scratch = Scratch::new();
+    let url_env_a = unique_env_var_name();
+    let url_env_b = unique_env_var_name();
+    let config = scratch.write(
+        "rlsnap.toml",
+        &format!(
+            "[targets.a]\nurl_env = \"{url_env_a}\"\nmode = \"catalog\"\n\n\
+             [targets.b]\nurl_env = \"{url_env_b}\"\nmode = \"catalog\"\n"
+        ),
+    );
+
+    let identical = run_bin(
+        &[
+            "drift",
+            "target:a",
+            "target:b",
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "table",
+        ],
+        &[(&url_env_a, &db_a.url()), (&url_env_b, &db_b.url())],
+    );
+    assert_eq!(identical.status, 0, "stderr: {}", identical.stderr);
+    assert_eq!(identical.stdout.trim(), "no differences");
+
+    db_b.load_fixture("ALTER TABLE widgets ADD COLUMN extra text;")
+        .await;
+
+    let differing = run_bin(
+        &[
+            "drift",
+            "target:a",
+            "target:b",
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "table",
+        ],
+        &[(&url_env_a, &db_a.url()), (&url_env_b, &db_b.url())],
+    );
+    assert_eq!(differing.status, 1, "stderr: {}", differing.stderr);
+    assert!(differing.stdout.contains("extra"));
+
+    db_a.close().await;
+    db_b.close().await;
+}
+
+#[tokio::test]
 async fn drift_can_compare_a_saved_snapshot_file_against_a_live_target() {
     let db_a = TestDb::create().await;
     let db_b = TestDb::create().await;

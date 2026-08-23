@@ -32,22 +32,23 @@ pub struct LockInfo {
     pub blocking: bool,
 }
 
-/// Relation-level locks held by this backend on relations in `schemas`, one
-/// entry per relation with the strongest mode seen, sorted by schema then
-/// relation.
+/// Relation-level locks held by this backend, one entry per relation with
+/// the strongest mode seen, sorted by schema then relation.
 ///
-/// Scoped to `schemas` (the same list the catalog snapshot uses) rather than
-/// reporting every lock this backend holds: rehearse's own introspection
+/// Deliberately NOT scoped to the caller's `--schema` list: a migration that
+/// locks a relation outside those schemas must still be reported, or the
+/// report would silently claim "no locks" for a real AccessExclusiveLock
+/// (see the safety finding this fixes). Instead this excludes, by name, the
+/// fixed set of schemas that are pure introspection noise: rehearse's own
 /// queries take `AccessShareLock` on `pg_catalog`/`information_schema`
-/// system tables, which is noise the caller never asked about; and a lock on
-/// a table's TOAST relation is named `pg_toast_<oid>`, where the OID comes
-/// from a non-transactional counter that keeps advancing even though every
-/// rehearsal rolls back — reporting it would make the JSON report
-/// nondeterministic across otherwise-identical runs.
-pub async fn fetch_locks(
-    tx: &RollbackTx,
-    schemas: &[String],
-) -> Result<Vec<LockInfo>, tokio_postgres::Error> {
+/// system tables; and `pg_toast` holds relations named `pg_toast_<oid>`,
+/// where the OID comes from a non-transactional counter that keeps
+/// advancing even though every rehearsal rolls back — reporting it would
+/// make the JSON report nondeterministic across otherwise-identical runs.
+/// Also restricted to ordinary and partitioned tables (`relkind` 'r'/'p'):
+/// a lock on an index or sequence the same migration just created does not
+/// itself block anyone and would only bury the table lock that matters.
+pub async fn fetch_locks(tx: &RollbackTx) -> Result<Vec<LockInfo>, tokio_postgres::Error> {
     let rows = tx
         .query(
             "SELECT n.nspname, c.relname, l.mode \
@@ -55,8 +56,9 @@ pub async fn fetch_locks(
              JOIN pg_class c ON c.oid = l.relation \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE l.pid = pg_backend_pid() AND l.locktype = 'relation' AND l.granted \
-                   AND n.nspname = ANY($1)",
-            &[&schemas],
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+                   AND c.relkind IN ('r', 'p')",
+            &[],
         )
         .await?;
 
@@ -121,6 +123,26 @@ pub async fn fetch_writes(tx: &RollbackTx) -> Result<Vec<WriteInfo>, tokio_postg
             n_tup_del: row.get(4),
         })
         .collect())
+}
+
+/// Ensure every schema in `schemas` actually exists in the database. A typo
+/// (e.g. `--schema pubic`) would otherwise silently produce an empty
+/// catalog on both sides of a diff, or an empty locks/writes/schema-changes
+/// report — a false "clean" result for exactly the thing this tool exists
+/// to catch.
+pub async fn require_known_schemas(tx: &RollbackTx, schemas: &[String]) -> anyhow::Result<()> {
+    let rows = tx
+        .query(
+            "SELECT nspname FROM pg_namespace WHERE nspname = ANY($1)",
+            &[&schemas],
+        )
+        .await?;
+    let found: std::collections::BTreeSet<String> = rows.into_iter().map(|r| r.get(0)).collect();
+    let missing: Vec<&String> = schemas.iter().filter(|s| !found.contains(*s)).collect();
+    if !missing.is_empty() {
+        anyhow::bail!("unknown schema(s), not found in the database: {missing:?}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

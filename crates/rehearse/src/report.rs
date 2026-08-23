@@ -29,6 +29,10 @@ pub enum StatementStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Failure {
     pub statement_index: usize,
+    /// First 200 chars of the full (possibly multi-line) statement — not
+    /// limited to the first line, unlike `StatementRecord::snippet`, so a
+    /// failing statement formatted across several lines still names the
+    /// construct that actually errored.
     pub snippet: String,
     pub sqlstate: String,
     pub message: String,
@@ -144,6 +148,15 @@ pub fn snippet(stmt: &str) -> String {
     first_line.chars().take(200).collect()
 }
 
+/// First 200 characters of the full (possibly multi-line) statement, used
+/// for `Failure::snippet`. Real migrations are routinely formatted across
+/// several lines, so naming only the first line of a failing statement
+/// (as `snippet` does for the statements list) often omits the construct
+/// that actually errored.
+pub fn failure_snippet(stmt: &str) -> String {
+    stmt.chars().take(200).collect()
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -157,5 +170,19 @@ mod unit_tests {
     fn snippet_truncates_to_200_chars() {
         let long = "x".repeat(300);
         assert_eq!(snippet(&long).chars().count(), 200);
+    }
+
+    #[test]
+    fn failure_snippet_keeps_all_lines_up_to_200_chars() {
+        let stmt =
+            "INSERT INTO widgets (id, qty)\nSELECT bogus_column\nFROM a_table_that_does_not_exist";
+        assert_eq!(failure_snippet(stmt), stmt);
+        assert!(failure_snippet(stmt).contains("a_table_that_does_not_exist"));
+    }
+
+    #[test]
+    fn failure_snippet_truncates_to_200_chars() {
+        let long = "x".repeat(300);
+        assert_eq!(failure_snippet(&long).chars().count(), 200);
     }
 }
