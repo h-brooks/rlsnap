@@ -16,7 +16,7 @@ pub async fn run(args: SchemaArgs) -> anyhow::Result<()> {
     let target = loaded.target(&args.target_name)?;
     let (statement_timeout_ms, lock_timeout_ms) = loaded.effective_timeouts(target);
 
-    let client = target.connect().await?;
+    let client = target.connect("rehearse").await?;
     let tx = RollbackTx::begin(client, statement_timeout_ms, lock_timeout_ms).await?;
     let snap = catalog::snapshot(&tx, &args.schemas).await?;
     tx.finish().await?;

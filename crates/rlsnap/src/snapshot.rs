@@ -114,7 +114,7 @@ async fn run_persona(
     want_rows: bool,
 ) -> Result<PersonaResult> {
     let client = target
-        .connect()
+        .connect("rlsnap")
         .await
         .context("connect for persona probe")?;
     let tx = RollbackTx::begin(client, target.statement_timeout_ms, target.lock_timeout_ms)
@@ -240,7 +240,10 @@ pub async fn build_snapshot(
 
     // Discover the schema shape (tables, columns, policies, functions) once,
     // as the connecting role, before probing any persona.
-    let discovery_client = target.connect().await.context("connect for discovery")?;
+    let discovery_client = target
+        .connect("rlsnap")
+        .await
+        .context("connect for discovery")?;
     let discovery_tx = RollbackTx::begin(
         discovery_client,
         target.statement_timeout_ms,

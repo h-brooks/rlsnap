@@ -76,7 +76,7 @@ pub async fn run_explain(
         );
     }
 
-    let client = target.connect().await.context("connect")?;
+    let client = target.connect("rlsnap").await.context("connect")?;
     let tx = RollbackTx::begin(client, target.statement_timeout_ms, target.lock_timeout_ms)
         .await
         .context("begin transaction")?;

@@ -44,7 +44,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<(Report, i32)> {
         )
     })?;
 
-    let client = target.connect().await?;
+    let client = target.connect("rehearse").await?;
     let tx = RollbackTx::begin(client, statement_timeout_ms, lock_timeout_ms).await?;
     require_known_schemas(&tx, &args.schemas).await?;
 

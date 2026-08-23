@@ -1,6 +1,11 @@
 //! Shared test support: spins up a fresh, uniquely-named database per test
 //! on the shared Postgres server, bootstraps the Supabase-style roles, and
 //! drops it on drop.
+//!
+//! This module is compiled fresh into each integration test binary, and no
+//! single test file uses every helper here, so dead-code warnings from the
+//! unused subset in any one binary are expected and suppressed.
+#![allow(dead_code)]
 
 use tokio_postgres::{Client, NoTls};
 

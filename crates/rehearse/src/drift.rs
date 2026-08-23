@@ -42,7 +42,7 @@ async fn load_catalog(
             let loaded = LoadedConfig::load(config_path)?;
             let target = loaded.target(name)?;
             let (statement_timeout_ms, lock_timeout_ms) = loaded.effective_timeouts(target);
-            let client = target.connect().await?;
+            let client = target.connect("rehearse").await?;
             let tx = RollbackTx::begin(client, statement_timeout_ms, lock_timeout_ms).await?;
             require_known_schemas(&tx, schemas).await?;
             let snap = catalog::snapshot(&tx, schemas).await?;
