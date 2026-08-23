@@ -6,12 +6,12 @@
 
 ## Why this exists
 
-If your security boundary lives in the database — grants, column privileges, row-level security — then it is invisible to every testing layer you already have. Unit tests don't reach it. Browser tests see a UI that looks fine. The database says nothing when a migration quietly widens or narrows access.
+If your security boundary lives in the database (grants, column privileges, row-level security) then it is invisible to every testing layer you already have. Unit tests don't reach it. Browser tests see a UI that looks fine. The database says nothing when a migration quietly widens or narrows access.
 
 The same defects keep shipping, everywhere RLS is used:
 
-- a migration adds a column, and **nobody re-grants the column-scoped UPDATE** — the UI write breaks for exactly one role
-- `INSERT` works but **`INSERT … RETURNING` fails**, because there's no SELECT policy — the save button errors after the row is in
+- a migration adds a column, and **nobody re-grants the column-scoped UPDATE**, so the UI write breaks for exactly one role
+- `INSERT` works but **`INSERT … RETURNING` fails**, because there's no SELECT policy, so the save button errors after the row is in
 - a default-grant pattern hands a **new permission to every role**
 - a "visible rows" helper **drifts from the policy** it's supposed to mirror
 - a function becomes **executable by `anon`** and nobody notices
@@ -35,12 +35,12 @@ exit code 1
 
 `rlsnap snapshot` connects to any Postgres (Supabase-first: personas are a role plus `request.jwt.claims`), and probes the full access matrix:
 
-- **catalog mode** (the default for prod targets): `has_table_privilege` / `has_column_privilege` / `has_function_privilege` per persona, plus the literal policy catalog from `pg_policies`. Zero DML — safe to point at production without a second thought.
-- **behavioural mode** (local/preview): real probes — `SELECT count(*)`, per-column `SELECT … LIMIT 0` and `UPDATE t SET col = col WHERE false`, `INSERT DEFAULT VALUES` and `INSERT … RETURNING` — each in its own savepoint, all inside a transaction that **always rolls back**. Outcomes are classified by SQLSTATE: `denied_privilege` vs `denied_rls` vs `constraint` (which proves the permission layer passed — Postgres evaluates RLS `WITH CHECK` before constraints).
+- **catalog mode** (the default for prod targets): `has_table_privilege` / `has_column_privilege` / `has_function_privilege` per persona, plus the literal policy catalog from `pg_policies`. Zero DML, safe to point at production without a second thought.
+- **behavioural mode** (local/preview): real probes: `SELECT count(*)`, per-column `SELECT … LIMIT 0` and `UPDATE t SET col = col WHERE false`, `INSERT DEFAULT VALUES` and `INSERT … RETURNING`, each in its own savepoint, all inside a transaction that **always rolls back**. Outcomes are classified by SQLSTATE: `denied_privilege` vs `denied_rls` vs `constraint` (which proves the permission layer passed: Postgres evaluates RLS `WITH CHECK` before constraints).
 
-The snapshot is deterministic JSON (sorted, timestamp-free, byte-identical across runs and pool sizes) — commit it. `rlsnap check` re-probes and diffs against the baseline; exit 1 on any change. `rlsnap accept` re-baselines after review. `rlsnap explain <persona> <table> <op>` shows the grants and policies behind one cell.
+The snapshot is deterministic JSON (sorted, timestamp-free, byte-identical across runs and pool sizes). Commit it. `rlsnap check` re-probes and diffs against the baseline; exit 1 on any change. `rlsnap accept` re-baselines after review. `rlsnap explain <persona> <table> <op>` shows the grants and policies behind one cell.
 
-Custom checks generalise into `[[asserts]]` — a named SQL query that must return zero rows, optionally evaluated *inside each persona's impersonated transaction*: tenant disjointness, helper/policy parity, governance allow-lists.
+Custom checks generalise into `[[asserts]]`: a named SQL query that must return zero rows, optionally evaluated *inside each persona's impersonated transaction*: tenant disjointness, helper/policy parity, governance allow-lists.
 
 ## Install
 
@@ -57,17 +57,17 @@ rlsnap snapshot --target local --out rlsnap.snap.json   # commit this
 rlsnap check --target local      # CI: exit 0 clean / 1 changes / 2 error
 ```
 
-Connection strings come only from environment variables — a literal URL in the config is a hard error, so the file is safe to commit.
+Connection strings come only from environment variables; a literal URL in the config is a hard error, so the file is safe to commit.
 
 ## Safety invariants
 
-- The only transaction terminator this workspace ever sends is `ROLLBACK` — enforced by a workspace-wide test, and by an integration test proving a full behavioural run leaves the database byte-identical.
+- The only transaction terminator this workspace ever sends is `ROLLBACK`, enforced by a workspace-wide test, and by an integration test proving a full behavioural run leaves the database byte-identical.
 - `SET LOCAL statement_timeout` / `lock_timeout` on every probe transaction.
 - Known residue: rolled-back `INSERT` probes still advance identity/serial sequences (Postgres doesn't undo that). Documented; `insert_probes = false` per target if it matters.
 
 ## Sibling: `rehearse`
 
-Same workspace, same core: run a **migration** against a real database (prod included) inside an always-rolled-back transaction, and get the report — per-statement timing, which relations would be locked and how hard, in-transaction write counts, the full catalog diff, and the exact failing statement. It refuses `COMMIT`/`END` inside migration files, so a stray transaction terminator can't turn a rehearsal into a deploy. `rehearse drift` diffs two databases' schemas — "which migrations are missing on prod" as one command.
+Same workspace, same core: run a **migration** against a real database (prod included) inside an always-rolled-back transaction, and get the report: per-statement timing, which relations would be locked and how hard, in-transaction write counts, the full catalog diff, and the exact failing statement. It refuses `COMMIT`/`END` inside migration files, so a stray transaction terminator can't turn a rehearsal into a deploy. `rehearse drift` diffs two databases' schemas: "which migrations are missing on prod" as one command.
 
 ```
 $ rehearse run 20260818_add_sku.sql --target staging
@@ -82,7 +82,7 @@ public.widgets: ins=0 upd=3 del=0
 
 ## What it doesn't do
 
-It doesn't tell you whether a grant is *correct* — only that it *changed*. You review the diff the way you review code. Detection is mechanical; judgment stays with you. Static lints (RLS off, `USING (true)`) are already in Supabase's dashboard advisors — rlsnap doesn't duplicate them; it tests behaviour.
+It doesn't tell you whether a grant is *correct*, only that it *changed*. You review the diff the way you review code. Detection is mechanical; judgment stays with you. Static lints (RLS off, `USING (true)`) are already in Supabase's dashboard advisors; rlsnap doesn't duplicate them; it tests behaviour.
 
 ## License
 
