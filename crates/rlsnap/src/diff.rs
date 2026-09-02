@@ -446,6 +446,37 @@ pub fn diff(a: &Snapshot, b: &Snapshot) -> Result<SnapshotDiff, DiffError> {
     })
 }
 
+/// Appended to `check`'s output when the diff's shape suggests
+/// default-privilege drift between the environment a baseline was probed
+/// against and the one it's being checked against, rather than a real
+/// access-control regression.
+pub const ENV_DRIFT_HINT: &str = "hint: default-privilege drift between environments can cause \
+DeniedPrivilege/Allowed flips; baselines are best probed against a freshly migrated database \
+(see docs)";
+
+fn is_denied_privilege_allowed_flip(before: &Option<Outcome>, after: &Option<Outcome>) -> bool {
+    matches!(
+        (before, after),
+        (Some(Outcome::DeniedPrivilege), Some(Outcome::Allowed))
+            | (Some(Outcome::Allowed), Some(Outcome::DeniedPrivilege))
+    )
+}
+
+/// Does this diff contain at least one cell that flipped between
+/// `DeniedPrivilege` and `Allowed` (either direction)? Checked across
+/// `privilege_changes` and `function_changes` -- the two sections whose
+/// cells are EXECUTE/table/column outcomes a default-grant difference can
+/// move. A single flip is enough: `check` prints [`ENV_DRIFT_HINT`] once no
+/// matter how many entries flip.
+pub fn has_env_drift_shape(d: &SnapshotDiff) -> bool {
+    d.privilege_changes
+        .iter()
+        .any(|c| is_denied_privilege_allowed_flip(&c.before, &c.after))
+        || d.function_changes
+            .iter()
+            .any(|c| is_denied_privilege_allowed_flip(&c.before, &c.after))
+}
+
 fn outcome_str(o: &Option<Outcome>) -> String {
     match o {
         None => "-".to_string(),

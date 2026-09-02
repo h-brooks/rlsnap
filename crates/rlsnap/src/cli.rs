@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::accept::{self, OnlyReport};
 use crate::config::RlsnapConfig;
 use crate::snapshot::{self, Snapshot};
 use crate::{diff, explain, init};
@@ -63,6 +64,13 @@ enum Command {
         target: String,
         #[arg(long)]
         with_rows: bool,
+        /// Update only baseline entries whose object identifier (a
+        /// function signature or a schema.table name) matches this
+        /// pattern (substring, or glob if it contains `*`). Repeatable;
+        /// every entry not matched by any --only stays byte-identical to
+        /// the existing baseline. Requires an existing baseline.
+        #[arg(long)]
+        only: Vec<String>,
     },
     /// Print the ACL entries and policies behind one cell.
     Explain {
@@ -97,6 +105,27 @@ fn read_snapshot(path: &Path) -> Result<Snapshot> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read snapshot {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parse snapshot {}", path.display()))
+}
+
+/// Print exactly which entries a scoped `accept --only` updated, per
+/// section, so the reviewer can see at a glance that nothing outside the
+/// named patterns moved.
+fn print_only_report(report: &OnlyReport) {
+    print_only_section("functions", &report.functions);
+    print_only_section("function_defs", &report.function_defs);
+    print_only_section("privileges", &report.privileges);
+    print_only_section("policies", &report.policies);
+}
+
+fn print_only_section(name: &str, entries: &[String]) {
+    if entries.is_empty() {
+        println!("  {name}: (none)");
+        return;
+    }
+    println!("  {name}:");
+    for entry in entries {
+        println!("    {entry}");
+    }
 }
 
 fn render_diff(d: &diff::SnapshotDiff, format: DiffFormat) -> String {
@@ -174,15 +203,45 @@ pub async fn run(args: &[String], cwd: &Path) -> Result<i32> {
             let current = snapshot::build_snapshot(&config, &target, with_rows).await?;
             let d = diff::diff(&baseline, &current)?;
             print!("{}", render_diff(&d, format));
+            // Only for the human-readable table: appending a text line
+            // after JSON output would break every consumer parsing it.
+            if matches!(format, DiffFormat::Table) && diff::has_env_drift_shape(&d) {
+                println!("{}", diff::ENV_DRIFT_HINT);
+            }
             Ok(d.exit_code(strict_data))
         }
 
-        Command::Accept { target, with_rows } => {
+        Command::Accept {
+            target,
+            with_rows,
+            only,
+        } => {
             let config = RlsnapConfig::find_and_load(cwd)?;
             let baseline_path = resolve(cwd, Path::new(&config.snapshot_path));
             let snap = snapshot::build_snapshot(&config, &target, with_rows).await?;
-            write_snapshot(&baseline_path, &snap)?;
-            println!("wrote {}", baseline_path.display());
+
+            if only.is_empty() {
+                write_snapshot(&baseline_path, &snap)?;
+                println!("wrote {}", baseline_path.display());
+                return Ok(0);
+            }
+
+            if !baseline_path.exists() {
+                bail!(
+                    "no baseline at {} -- run `rlsnap accept --target {target}` (without \
+                     --only) first",
+                    baseline_path.display()
+                );
+            }
+            let baseline = read_snapshot(&baseline_path)?;
+            let (merged, report) = accept::scoped_merge(&baseline, &snap, &only)?;
+            write_snapshot(&baseline_path, &merged)?;
+            println!(
+                "wrote {} (scoped to {} --only pattern(s))",
+                baseline_path.display(),
+                only.len()
+            );
+            print_only_report(&report);
             Ok(0)
         }
 

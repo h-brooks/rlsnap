@@ -5,6 +5,7 @@
 //! no transaction-terminating statements of its own). (This sentence is the
 //! only place the word "COMMIT" appears in this crate's source.)
 
+pub mod accept;
 pub mod cli;
 pub mod config;
 pub mod diff;
