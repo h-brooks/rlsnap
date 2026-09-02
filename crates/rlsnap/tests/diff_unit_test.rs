@@ -181,6 +181,103 @@ fn findings_sharing_a_name_do_not_collapse_in_the_diff() {
     );
 }
 
+/// The motivating shape: a persona's outcome on the same cell flips between
+/// DeniedPrivilege and Allowed. This is the signature of default-privilege
+/// drift between a probe environment and a clean rebuild, not necessarily a
+/// real regression, so `check` should append a hint pointing at that.
+#[test]
+fn denied_privilege_to_allowed_flip_has_env_drift_shape() {
+    let mut a = empty_snapshot();
+    let mut b = empty_snapshot();
+
+    let mut cols_a = BTreeMap::new();
+    cols_a.insert(
+        "id".to_string(),
+        ColumnPriv {
+            select: Some(Outcome::DeniedPrivilege),
+            update: None,
+        },
+    );
+    a.privileges.insert(
+        "service_role".to_string(),
+        BTreeMap::from([(
+            "public.widgets".to_string(),
+            TablePriv {
+                columns: cols_a,
+                ..Default::default()
+            },
+        )]),
+    );
+
+    let mut cols_b = BTreeMap::new();
+    cols_b.insert(
+        "id".to_string(),
+        ColumnPriv {
+            select: Some(Outcome::Allowed),
+            update: None,
+        },
+    );
+    b.privileges.insert(
+        "service_role".to_string(),
+        BTreeMap::from([(
+            "public.widgets".to_string(),
+            TablePriv {
+                columns: cols_b,
+                ..Default::default()
+            },
+        )]),
+    );
+
+    let d = diff::diff(&a, &b).unwrap();
+    assert!(diff::has_env_drift_shape(&d));
+}
+
+/// The reverse direction (Allowed -> DeniedPrivilege) is the same shape.
+#[test]
+fn allowed_to_denied_privilege_flip_has_env_drift_shape() {
+    let mut a = empty_snapshot();
+    let mut b = empty_snapshot();
+    a.functions
+        .entry("anon".to_string())
+        .or_default()
+        .insert("public.myfunc()".to_string(), Outcome::Allowed);
+    b.functions
+        .entry("anon".to_string())
+        .or_default()
+        .insert("public.myfunc()".to_string(), Outcome::DeniedPrivilege);
+
+    let d = diff::diff(&a, &b).unwrap();
+    assert!(diff::has_env_drift_shape(&d));
+}
+
+/// A DeniedRls <-> Allowed flip is a different failure mode (a policy
+/// change, not default-privilege drift) and must not trigger the hint.
+#[test]
+fn denied_rls_flip_does_not_have_env_drift_shape() {
+    let mut a = empty_snapshot();
+    let mut b = empty_snapshot();
+    a.functions
+        .entry("anon".to_string())
+        .or_default()
+        .insert("public.myfunc()".to_string(), Outcome::Allowed);
+    b.functions
+        .entry("anon".to_string())
+        .or_default()
+        .insert("public.myfunc()".to_string(), Outcome::DeniedRls);
+
+    let d = diff::diff(&a, &b).unwrap();
+    assert!(!diff::has_env_drift_shape(&d));
+}
+
+/// A diff with no changes at all obviously has no drift shape either.
+#[test]
+fn empty_diff_does_not_have_env_drift_shape() {
+    let a = empty_snapshot();
+    let b = a.clone();
+    let d = diff::diff(&a, &b).unwrap();
+    assert!(!diff::has_env_drift_shape(&d));
+}
+
 #[test]
 fn json_diff_round_trips_through_serde() {
     let a = empty_snapshot();

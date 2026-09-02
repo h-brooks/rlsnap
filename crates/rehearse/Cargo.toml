@@ -4,7 +4,7 @@ version = "0.2.1"
 edition = { workspace = true }
 license = { workspace = true }
 description = "Rehearse Postgres migrations inside an always-rolled-back transaction: per-statement timing, lock report, catalog diff, schema drift"
-repository = "https://github.com/h-brooks/rlsnap"
+repository = "https://github.com/h-brooks/drydock"
 keywords = ["postgres", "migrations", "supabase", "schema", "testing"]
 categories = ["command-line-utilities", "database"]
 

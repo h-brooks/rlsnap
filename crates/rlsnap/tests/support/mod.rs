@@ -227,6 +227,7 @@ impl TestHarness {
     }
 
     /// Run `rlsnap::run` against this harness's working directory.
+    #[allow(dead_code)]
     pub async fn run(&self, args: &[&str]) -> anyhow::Result<i32> {
         let args: Vec<String> = std::iter::once("rlsnap".to_string())
             .chain(args.iter().map(|s| s.to_string()))
@@ -243,6 +244,34 @@ impl TestHarness {
         self.db.close().await;
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+
+    /// Run the actual built `rlsnap` binary (not the library seam) with
+    /// `args` in this harness's working directory, capturing its exit code
+    /// and stdout/stderr. The child inherits this process's environment (in
+    /// particular the `url_env_name` variable `new` set), so it needs no
+    /// extra env of its own. Only reach for this over `run` when a test
+    /// needs to assert on the CLI's printed text itself, since `run` (the
+    /// library seam) can't observe stdout.
+    #[allow(dead_code)]
+    pub fn run_bin(&self, args: &[&str]) -> BinResult {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rlsnap"))
+            .args(args)
+            .current_dir(&self.dir)
+            .output()
+            .expect("run rlsnap binary");
+        BinResult {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub struct BinResult {
+    pub status: i32,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 #[allow(dead_code)]

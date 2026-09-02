@@ -1,8 +1,12 @@
-# rlsnap
+# drydock
 
-**Snapshot testing for Postgres access control.** Probe every persona × table × column × operation, commit the snapshot, diff it in CI.
+**Pre-launch inspection tools for Postgres apps.** A dry dock is where a vessel is inspected before it goes back out to sea: drydock applies the same idea to a Postgres-backed app about to ship a migration. It holds three tools built on one shared core:
 
-[![CI](https://github.com/h-brooks/rlsnap/actions/workflows/ci.yml/badge.svg)](https://github.com/h-brooks/rlsnap/actions/workflows/ci.yml)
+- **rlsnap**: snapshot testing for Postgres access control. Probe every persona × table × column × operation, commit the snapshot, diff it in CI.
+- **rehearse**: run a migration inside an always-rolled-back transaction and get the report (locks, timings, catalog diff) before it ever touches a database that matters.
+- **pgcore**: the shared core underneath both tools (env-only targets, always-ROLLBACK transactions, persona impersonation, SQLSTATE classification).
+
+[![CI](https://github.com/h-brooks/drydock/actions/workflows/ci.yml/badge.svg)](https://github.com/h-brooks/drydock/actions/workflows/ci.yml)
 
 ## Why this exists
 
@@ -45,7 +49,7 @@ Custom checks generalise into `[[asserts]]`: a named SQL query that must return 
 ## Install
 
 ```
-cargo install --git https://github.com/h-brooks/rlsnap rlsnap
+cargo install --git https://github.com/h-brooks/drydock rlsnap
 ```
 
 ## Quick start
@@ -64,6 +68,23 @@ Connection strings come only from environment variables; a literal URL in the co
 - The only transaction terminator this workspace ever sends is `ROLLBACK`, enforced by a workspace-wide test, and by an integration test proving a full behavioural run leaves the database byte-identical.
 - `SET LOCAL statement_timeout` / `lock_timeout` on every probe transaction.
 - Known residue: rolled-back `INSERT` probes still advance identity/serial sequences (Postgres doesn't undo that). Documented; `insert_probes = false` per target if it matters.
+
+## Probing environments
+
+A baseline records the outcomes of the environment it was probed against, not some fixed truth about the schema. Two databases can have the exact same migrations applied and still answer a persona's probe differently, because Postgres's default privileges (what a newly created table or function grants to `PUBLIC`, or to a role, by default) are a property of the database, not of the migration ledger. A long-lived shared development database, having accumulated ad hoc grants and manual fixes over time, can easily drift from a database rebuilt cleanly from the same migrations, even though both count as "up to date".
+
+In practice this shows up as a persona's outcome flipping between `denied_privilege` and `allowed` on a cell that no migration actually touched. `rlsnap check` recognises this shape and appends a one-line hint to the diff, since it usually means the baseline was probed somewhere other than a clean rebuild, not that access genuinely changed.
+
+Two ways to keep this from becoming a problem:
+
+- **Probe baselines in a clean environment.** Run `rlsnap accept` against a database freshly rebuilt from the migration history, not a shared development database that has accumulated manual changes over time. CI already does this by construction (it always rebuilds before it snapshots); doing the same before an `accept` locally keeps the baseline trustworthy.
+- **When a clean rebuild isn't available, use `accept --only` instead of hand-editing the JSON.** `rlsnap accept --target <target> --only <pattern>` (repeatable) probes normally, but writes back only the baseline entries whose object identifier, a function signature or a `schema.table` name, matches a given pattern (a plain substring, or a glob if the pattern contains `*`). Every other entry in the snapshot file stays byte-identical, for example:
+
+  ```
+  rlsnap accept --target local --only set_widget_owner --only 'public.grant_*'
+  ```
+
+  This is the surgical alternative to hand-editing a snapshot: no risk of typing a persona's outcome in wrong, and the diff of the resulting commit shows exactly which entries changed.
 
 ## Sibling: `rehearse`
 

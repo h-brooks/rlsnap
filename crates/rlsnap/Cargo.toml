@@ -4,7 +4,7 @@ version = "0.2.1"
 edition = { workspace = true }
 license = { workspace = true }
 description = "Snapshot testing for Postgres access control: probe every persona x table x column x operation, commit the snapshot, diff it in CI"
-repository = "https://github.com/h-brooks/rlsnap"
+repository = "https://github.com/h-brooks/drydock"
 keywords = ["postgres", "supabase", "rls", "row-level-security", "testing"]
 categories = ["command-line-utilities", "database"]
 
